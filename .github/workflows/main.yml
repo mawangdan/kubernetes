@@ -18,6 +18,7 @@ jobs:
     - name: Checkout target repo
       uses: actions/checkout@v2
       with:
+        fetch-depth: 0
         # optional: set the branch to checkout,
         # sync action checks out your 'target_sync_branch' anyway
         ref:  master
