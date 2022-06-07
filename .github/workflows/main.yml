@@ -11,9 +11,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: tgymnich/fork-sync@v1.3
+      - uses: tgymnich/fork-sync@v1.4
         with:
-          token: ${{ secrets.access_token }}
+          token: ${{ secrets.access_token2 }}
           owner: kubernetes
           base: master
           head: master
