@@ -104,8 +104,10 @@ aliases:
   release-managers:
     - cpanato
     - justaugustus
+    - palnabarun
     - puerco
     - saschagrunert
+    - Verolop
     - xmudrii
   build-image-approvers:
     - BenTheElder
@@ -113,8 +115,10 @@ aliases:
     - cpanato # SIG Technical Lead / RelEng subproject owner / Release Manager
     - dims
     - justaugustus # SIG Chair / RelEng subproject owner / Release Manager
+    - palnabarun # Release Manager
     - puerco # SIG Technical Lead / RelEng subproject owner / Release Manager
     - saschagrunert # SIG Chair / RelEng subproject owner / Release Manager
+    - Verolop # Release Manager
     - xmudrii # Release Manager
   build-image-reviewers:
     - BenTheElder
@@ -123,8 +127,10 @@ aliases:
     - dims
     - jeremyrickard # SIG Technical Lead / RelEng subproject owner
     #- justaugustus # SIG Chair / RelEng subproject owner / Release Manager - approvals only
+    - palnabarun # Release Manager
     - puerco # SIG Technical Lead / RelEng subproject owner / Release Manager
     - saschagrunert # SIG Chair / RelEng subproject owner / Release Manager
+    - Verolop # Release Manager
     - xmudrii # Release Manager
   sig-storage-approvers:
     - saad-ali
@@ -168,6 +174,7 @@ aliases:
     - damemi
     - chendave
     - denkensk
+    - sanposhiho
   # emeritus:
   # - adtac
   # - liu-cong
@@ -255,9 +262,9 @@ aliases:
     - danwinship
     - dcbw
     - freehan
-    - johnbelamaric
     - khenidak
     - mrhohn
+    - robscott
     - thockin
   sig-network-reviewers:
     - andrewsykim
@@ -267,9 +274,9 @@ aliases:
     - danwinship
     - dcbw
     - freehan
-    - johnbelamaric
     - khenidak
     - mrhohn
+    - robscott
     - thockin
   sig-apps-approvers:
     - kow3ns
@@ -292,7 +299,6 @@ aliases:
     - MaciekPytel
     - mwielgus
   sig-instrumentation-approvers:
-    - brancz
     - logicalhan
     - dashpole
     - ehashman
@@ -300,19 +306,17 @@ aliases:
     - serathius
     - dgrisonnet
   sig-instrumentation-reviewers:
-    - brancz
     - dashpole
     - ehashman
     - s-urbaniak
-    - andyxning
     - coffeepac
     - logicalhan
     - RainbowMango
     - serathius
-    - lilic
     - dgrisonnet
     - pohly
   # sig-instrumentation-emeritus
+  # - brancz
   # - DirectXMan12
 
   api-approvers:
