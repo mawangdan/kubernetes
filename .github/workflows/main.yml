@@ -4,16 +4,18 @@ on:
   schedule:
     - cron: '0 19 1 * *' # every 30 minutes
   workflow_dispatch: # on button click
-
 jobs:
   sync:
-
     runs-on: ubuntu-latest
 
     steps:
-      - uses: tgymnich/fork-sync@v1.4
+      - uses: tgymnich/fork-sync@v1.3
         with:
-          token: ${{ secrets.access_token2 }}
           owner: kubernetes
-          base: master
+          github_token: ${{ secrets.access_token2 }}
+          personal_token: ${{ secrets.access_token2 }}
           head: master
+          base: master
+          merge_method: merge
+          pr_title: Fork Sync
+          auto_approve: true
