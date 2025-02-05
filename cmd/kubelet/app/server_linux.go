@@ -19,8 +19,6 @@ package app
 import (
 	"k8s.io/klog/v2"
 	"k8s.io/utils/inotify"
-
-	libcontainercgroups "github.com/opencontainers/runc/libcontainer/cgroups"
 )
 
 func watchForLockfileContention(path string, done chan struct{}) error {
@@ -37,7 +35,7 @@ func watchForLockfileContention(path string, done chan struct{}) error {
 	go func() {
 		select {
 		case ev := <-watcher.Event:
-			klog.InfoS("inotify event", "event", ev)
+			klog.InfoS("Inotify event", "event", ev)
 		case err = <-watcher.Error:
 			klog.ErrorS(err, "inotify watcher error")
 		}
@@ -45,8 +43,4 @@ func watchForLockfileContention(path string, done chan struct{}) error {
 		watcher.Close()
 	}()
 	return nil
-}
-
-func isCgroup2UnifiedMode() bool {
-	return libcontainercgroups.IsCgroup2UnifiedMode()
 }

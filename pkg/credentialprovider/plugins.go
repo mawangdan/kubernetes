@@ -17,39 +17,39 @@ limitations under the License.
 package credentialprovider
 
 import (
-	"reflect"
-	"sort"
 	"sync"
 
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
-	"k8s.io/kubernetes/pkg/features"
 )
+
+type provider struct {
+	name string
+	impl DockerConfigProvider
+}
 
 // All registered credential providers.
 var providersMutex sync.Mutex
-var providers = make(map[string]DockerConfigProvider)
+var providers = make([]provider, 0)
+var seenProviderNames = sets.NewString()
 
 // RegisterCredentialProvider is called by provider implementations on
 // initialization to register themselves, like so:
-//   func init() {
-//    	RegisterCredentialProvider("name", &myProvider{...})
-//   }
-func RegisterCredentialProvider(name string, provider DockerConfigProvider) {
+//
+//	func init() {
+//	 	RegisterCredentialProvider("name", &myProvider{...})
+//	}
+func RegisterCredentialProvider(name string, p DockerConfigProvider) {
 	providersMutex.Lock()
 	defer providersMutex.Unlock()
-	_, found := providers[name]
-	if found {
+
+	if seenProviderNames.Has(name) {
 		klog.Fatalf("Credential provider %q was registered twice", name)
 	}
-	klog.V(4).Infof("Registered credential provider %q", name)
-	providers[name] = provider
-}
+	seenProviderNames.Insert(name)
 
-// AreLegacyCloudCredentialProvidersDisabled checks if the legacy in-tree cloud
-// credential providers have been disabled.
-func AreLegacyCloudCredentialProvidersDisabled() bool {
-	return utilfeature.DefaultFeatureGate.Enabled(features.DisableKubeletCloudCredentialProviders)
+	providers = append(providers, provider{name, p})
+	klog.V(4).Infof("Registered credential provider %q", name)
 }
 
 // NewDockerKeyring creates a DockerKeyring to use for resolving credentials,
@@ -59,18 +59,10 @@ func NewDockerKeyring() DockerKeyring {
 		Providers: make([]DockerConfigProvider, 0),
 	}
 
-	keys := reflect.ValueOf(providers).MapKeys()
-	stringKeys := make([]string, len(keys))
-	for ix := range keys {
-		stringKeys[ix] = keys[ix].String()
-	}
-	sort.Strings(stringKeys)
-
-	for _, key := range stringKeys {
-		provider := providers[key]
-		if provider.Enabled() {
-			klog.V(4).Infof("Registering credential provider: %v", key)
-			keyring.Providers = append(keyring.Providers, provider)
+	for _, p := range providers {
+		if p.impl.Enabled() {
+			klog.V(4).Infof("Registering credential provider: %v", p.name)
+			keyring.Providers = append(keyring.Providers, p.impl)
 		}
 	}
 

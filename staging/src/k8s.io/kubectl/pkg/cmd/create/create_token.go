@@ -20,8 +20,10 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,12 +31,14 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/cli-runtime/pkg/genericiooptions"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/scheme"
-	"k8s.io/kubectl/pkg/util"
+	"k8s.io/kubectl/pkg/util/completion"
 	"k8s.io/kubectl/pkg/util/templates"
 	"k8s.io/kubectl/pkg/util/term"
+	"k8s.io/utils/ptr"
 )
 
 // TokenOptions is the data required to perform a token request operation.
@@ -42,6 +46,9 @@ type TokenOptions struct {
 	// PrintFlags holds options necessary for obtaining a printer
 	PrintFlags *genericclioptions.PrintFlags
 	PrintObj   func(obj runtime.Object) error
+
+	// Flags hold the parsed CLI flags.
+	Flags *pflag.FlagSet
 
 	// Name and namespace of service account to create a token for
 	Name      string
@@ -57,14 +64,14 @@ type TokenOptions struct {
 	// Audiences indicate the valid audiences for the requested token. If unset, defaults to the Kubernetes API server audiences.
 	Audiences []string
 
-	// ExpirationSeconds is the requested token lifetime. Optional.
-	ExpirationSeconds int64
+	// Duration is the requested token lifetime. Optional.
+	Duration time.Duration
 
 	// CoreClient is the API client used to request the token. Required.
 	CoreClient corev1client.CoreV1Interface
 
 	// IOStreams are the output streams for the operation. Required.
-	genericclioptions.IOStreams
+	genericiooptions.IOStreams
 }
 
 var (
@@ -78,7 +85,7 @@ var (
 		kubectl create token myapp --namespace myns
 
 		# Request a token with a custom expiration
-		kubectl create token myapp --expiration-seconds 600
+		kubectl create token myapp --duration 10m
 
 		# Request a token with a custom audience
 		kubectl create token myapp --audience https://example.com
@@ -86,17 +93,18 @@ var (
 		# Request a token bound to an instance of a Secret object
 		kubectl create token myapp --bound-object-kind Secret --bound-object-name mysecret
 
-		# Request a token bound to an instance of a Secret object with a specific uid
+		# Request a token bound to an instance of a Secret object with a specific UID
 		kubectl create token myapp --bound-object-kind Secret --bound-object-name mysecret --bound-object-uid 0d4691ed-659b-4935-a832-355f77ee47cc
 `)
-
-	boundObjectKindToAPIVersion = map[string]string{
-		"Pod":    "v1",
-		"Secret": "v1",
-	}
 )
 
-func NewTokenOpts(ioStreams genericclioptions.IOStreams) *TokenOptions {
+var boundObjectKinds = map[string]string{
+	"Pod":    "v1",
+	"Secret": "v1",
+	"Node":   "v1",
+}
+
+func NewTokenOpts(ioStreams genericiooptions.IOStreams) *TokenOptions {
 	return &TokenOptions{
 		PrintFlags: genericclioptions.NewPrintFlags("created").WithTypeSetter(scheme.Scheme),
 		IOStreams:  ioStreams,
@@ -104,7 +112,7 @@ func NewTokenOpts(ioStreams genericclioptions.IOStreams) *TokenOptions {
 }
 
 // NewCmdCreateToken returns an initialized Command for 'create token' sub command
-func NewCmdCreateToken(f cmdutil.Factory, ioStreams genericclioptions.IOStreams) *cobra.Command {
+func NewCmdCreateToken(f cmdutil.Factory, ioStreams genericiooptions.IOStreams) *cobra.Command {
 	o := NewTokenOpts(ioStreams)
 
 	cmd := &cobra.Command{
@@ -113,7 +121,7 @@ func NewCmdCreateToken(f cmdutil.Factory, ioStreams genericclioptions.IOStreams)
 		Short:                 "Request a service account token",
 		Long:                  tokenLong,
 		Example:               tokenExample,
-		ValidArgsFunction:     util.ResourceNameCompletionFunc(f, "serviceaccount"),
+		ValidArgsFunction:     completion.ResourceNameCompletionFunc(f, "serviceaccount"),
 		Run: func(cmd *cobra.Command, args []string) {
 			if err := o.Complete(f, cmd, args); err != nil {
 				cmdutil.CheckErr(err)
@@ -134,10 +142,10 @@ func NewCmdCreateToken(f cmdutil.Factory, ioStreams genericclioptions.IOStreams)
 
 	cmd.Flags().StringArrayVar(&o.Audiences, "audience", o.Audiences, "Audience of the requested token. If unset, defaults to requesting a token for use with the Kubernetes API server. May be repeated to request a token valid for multiple audiences.")
 
-	cmd.Flags().Int64Var(&o.ExpirationSeconds, "expiration-seconds", o.ExpirationSeconds, "Requested lifetime of the issued token. The server may return a token with a longer or shorter lifetime.")
+	cmd.Flags().DurationVar(&o.Duration, "duration", o.Duration, "Requested lifetime of the issued token. If not set or if set to 0, the lifetime will be determined by the server automatically. The server may return a token with a longer or shorter lifetime.")
 
 	cmd.Flags().StringVar(&o.BoundObjectKind, "bound-object-kind", o.BoundObjectKind, "Kind of an object to bind the token to. "+
-		"Supported kinds are "+strings.Join(sets.StringKeySet(boundObjectKindToAPIVersion).List(), ", ")+". "+
+		"Supported kinds are "+strings.Join(sets.List(sets.KeySet(boundObjectKinds)), ", ")+". "+
 		"If set, --bound-object-name must be provided.")
 	cmd.Flags().StringVar(&o.BoundObjectName, "bound-object-name", o.BoundObjectName, "Name of an object to bind the token to. "+
 		"The token will expire when the object is deleted. "+
@@ -145,6 +153,8 @@ func NewCmdCreateToken(f cmdutil.Factory, ioStreams genericclioptions.IOStreams)
 	cmd.Flags().StringVar(&o.BoundObjectUID, "bound-object-uid", o.BoundObjectUID, "UID of an object to bind the token to. "+
 		"Requires --bound-object-kind and --bound-object-name. "+
 		"If unset, the UID of the existing object is used.")
+
+	o.Flags = cmd.Flags()
 
 	return cmd
 }
@@ -192,8 +202,11 @@ func (o *TokenOptions) Validate() error {
 	if len(o.Namespace) == 0 {
 		return fmt.Errorf("--namespace is required")
 	}
-	if o.ExpirationSeconds < 0 {
-		return fmt.Errorf("--expiration-seconds must be positive")
+	if o.Duration < 0 {
+		return fmt.Errorf("--duration must be greater than or equal to 0")
+	}
+	if o.Duration%time.Second != 0 {
+		return fmt.Errorf("--duration cannot be expressed in units less than seconds")
 	}
 	for _, aud := range o.Audiences {
 		if len(aud) == 0 {
@@ -209,8 +222,8 @@ func (o *TokenOptions) Validate() error {
 			return fmt.Errorf("--bound-object-uid can only be set if --bound-object-kind is provided")
 		}
 	} else {
-		if _, ok := boundObjectKindToAPIVersion[o.BoundObjectKind]; !ok {
-			return fmt.Errorf("supported --bound-object-kind values are %s", strings.Join(sets.StringKeySet(boundObjectKindToAPIVersion).List(), ", "))
+		if _, ok := boundObjectKinds[o.BoundObjectKind]; !ok {
+			return fmt.Errorf("supported --bound-object-kind values are %s", strings.Join(sets.List(sets.KeySet(boundObjectKinds)), ", "))
 		}
 		if len(o.BoundObjectName) == 0 {
 			return fmt.Errorf("--bound-object-name is required if --bound-object-kind is provided")
@@ -227,13 +240,13 @@ func (o *TokenOptions) Run() error {
 			Audiences: o.Audiences,
 		},
 	}
-	if o.ExpirationSeconds > 0 {
-		request.Spec.ExpirationSeconds = &o.ExpirationSeconds
+	if o.Duration > 0 {
+		request.Spec.ExpirationSeconds = ptr.To(int64(o.Duration / time.Second))
 	}
 	if len(o.BoundObjectKind) > 0 {
 		request.Spec.BoundObjectRef = &authenticationv1.BoundObjectReference{
 			Kind:       o.BoundObjectKind,
-			APIVersion: boundObjectKindToAPIVersion[o.BoundObjectKind],
+			APIVersion: boundObjectKinds[o.BoundObjectKind],
 			Name:       o.BoundObjectName,
 			UID:        types.UID(o.BoundObjectUID),
 		}

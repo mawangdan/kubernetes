@@ -24,16 +24,17 @@ set -o nounset
 set -o pipefail
 
 ### Hardcoded constants
-DEFAULT_CNI_VERSION='v0.9.1'
-DEFAULT_CNI_HASH='b5a59660053a5f1a33b5dd5624d9ed61864482d9dc8e5b79c9b3afc3d6f62c9830e1c30f9ccba6ee76f5fb1ff0504e58984420cc0680b26cb643f1cb07afbd1c'
-DEFAULT_NPD_VERSION='v0.8.9'
-DEFAULT_NPD_HASH_AMD64='4919c47447c5f3871c1dc3171bbb817a38c8c8d07a6ce55a77d43cadc098e9ad608ceeab121eec00c13c0b6a2cc3488544d61ce84cdade1823f3fd5163a952de'
-# TODO (SergeyKanzhelev): fill up for npd 0.8.9+
-DEFAULT_NPD_HASH_ARM64='8ccb42a862efdfc1f25ca9a22f3fd36f9fdff1ac618dd7d39e3b5991505dd610d432364420896ad71f42197a116f28a85dde58b129baa075ebb7312caa57f852'
-DEFAULT_CRICTL_VERSION='v1.23.0'
-DEFAULT_CRICTL_AMD64_SHA512='f8c40c66c8d9a85e857399506f4977564890815b02658eec591114e04bd8bc6b8ea08bcc159af0088b5eda7bf0dfd16096bf0c174819c204193fb7343ae7d9d5'
-DEFAULT_CRICTL_ARM64_SHA512='261ac360b0ac3fc88c81f1cc348f84b0df0b07ca4db61b0e647c142882d129ba11d21d0de373a27ecfd984436a08a11b19cde2ad5e3412e5d03203caedd62d92'
+DEFAULT_CNI_VERSION='v1.6.2'
+DEFAULT_CNI_HASH='23036eea642c55cd38d6a2d8f18837fac78e3d2bc6ec86dc2047dad5e51323efdc8dfd0482ac78fe9f117e4e630d0015e190e4a6a3544fc50dc59e5083459629'
+DEFAULT_NPD_VERSION='v0.8.20'
+DEFAULT_NPD_HASH_AMD64='09029b62f8023885f3a856c20b5fafecabb880806467848ae25f578c4ee6afacd97c85a0c2d0c582c8d79d3716c83d0e7d324073c5816ae5a812812a6f21450b'
+DEFAULT_NPD_HASH_ARM64='233f7e4451de920b7ce8b0ac0e46da1a07ef559e628a75746ce7927492a1886ebd007875f76462d2d0bf3b1dc807a7e8321108cafbd7db9eee39c0e2cfb6c051'
+DEFAULT_CRICTL_VERSION='v1.32.0'
+DEFAULT_CRICTL_AMD64_SHA512='f0edcc1e6c42315e51789255bdff4f6c2a151ad6f92c7de813b0df3a34ea44211c5c2c369b6629090885f834172819a8c113927c695df8818ccc440abdcb517f'
+DEFAULT_CRICTL_ARM64_SHA512='ef0696b59ccae9c535470111c6385d5721047897c14f9b56ddc1893e170d4053afd254b527f05be248100b0980033035a8fba589402fe47966163021cf0e82e3'
 DEFAULT_MOUNTER_TAR_SHA='7956fd42523de6b3107ddc3ce0e75233d2fcb78436ff07a1389b6eaac91fb2b1b72a08f7a219eaf96ba1ca4da8d45271002e0d60e0644e796c665f99bb356516'
+AUTH_PROVIDER_GCP_HASH_LINUX_AMD64="${AUTH_PROVIDER_GCP_HASH_LINUX_AMD64:-156058e5b3994cba91c23831774033e0d505d6d8b80f43541ef6af91b320fd9dfaabe42ec8a8887b51d87104c2b57e1eb895649d681575ffc80dd9aee8e563db}"
+AUTH_PROVIDER_GCP_HASH_LINUX_ARM64="${AUTH_PROVIDER_GCP_HASH_LINUX_ARM64:-1aa3b0bea10a9755231989ffc150cbfa770f1d96932db7535473f7bfeb1108bafdae80202ae738d59495982512e716ff7366d5f414d0e76dd50519f98611f9ab}"
 ###
 
 # Standard curl flags.
@@ -294,9 +295,14 @@ function install-node-problem-detector {
     return
   fi
 
-  echo "Downloading ${npd_tar}."
-  local -r npd_release_path="${NODE_PROBLEM_DETECTOR_RELEASE_PATH:-https://storage.googleapis.com/kubernetes-release}"
-  download-or-bust "${npd_hash}" "${npd_release_path}/node-problem-detector/${npd_tar}"
+  if [[ -n "${NODE_PROBLEM_DETECTOR_RELEASE_PATH:-}" ]]; then
+    echo "Downloading ${npd_tar} from ${NODE_PROBLEM_DETECTOR_RELEASE_PATH}."
+    local -r download_path="${NODE_PROBLEM_DETECTOR_RELEASE_PATH}/node-problem-detector/${npd_tar}"
+  else
+    echo "Downloading ${npd_tar} from github."
+    local -r download_path="https://github.com/kubernetes/node-problem-detector/releases/download/${npd_version}/${npd_tar}"
+  fi
+  download-or-bust "${npd_hash}" "${download_path}"
   local -r npd_dir="${KUBE_HOME}/node-problem-detector"
   mkdir -p "${npd_dir}"
   tar xzf "${KUBE_HOME}/${npd_tar}" -C "${npd_dir}" --overwrite
@@ -367,37 +373,11 @@ EOF
   fi
 
   echo "Downloading crictl"
-  local -r crictl_path="https://storage.googleapis.com/k8s-artifacts-cri-tools/release/${crictl_version}"
+  local -r crictl_path="https://github.com/kubernetes-sigs/cri-tools/releases/download/${crictl_version}"
   download-or-bust "${crictl_hash}" "${crictl_path}/${crictl}"
   tar xf "${crictl}"
   mv crictl "${KUBE_BIN}/crictl"
   rm -f "${crictl}"
-}
-
-function install-exec-auth-plugin {
-  if [[ ! "${EXEC_AUTH_PLUGIN_URL:-}" ]]; then
-      return
-  fi
-  local -r plugin_url="${EXEC_AUTH_PLUGIN_URL}"
-  local -r plugin_hash="${EXEC_AUTH_PLUGIN_HASH}"
-
-  if is-preloaded "gke-exec-auth-plugin" "${plugin_hash}"; then
-    echo "gke-exec-auth-plugin is preloaded"
-    return
-  fi
-
-  echo "Downloading gke-exec-auth-plugin binary"
-  download-or-bust "${plugin_hash}" "${plugin_url}"
-  mv "${KUBE_HOME}/gke-exec-auth-plugin" "${KUBE_BIN}/gke-exec-auth-plugin"
-  chmod a+x "${KUBE_BIN}/gke-exec-auth-plugin"
-
-  if [[ ! "${EXEC_AUTH_PLUGIN_LICENSE_URL:-}" ]]; then
-      return
-  fi
-  local -r license_url="${EXEC_AUTH_PLUGIN_LICENSE_URL}"
-  echo "Downloading gke-exec-auth-plugin license"
-  download-or-bust "" "${license_url}"
-  mv "${KUBE_HOME}/LICENSES/LICENSE" "${KUBE_BIN}/gke-exec-auth-plugin-license"
 }
 
 function install-kube-manifests {
@@ -425,20 +405,18 @@ function install-kube-manifests {
   echo "Downloading k8s manifests tar"
   download-or-bust "${manifests_tar_hash}" "${manifests_tar_urls[@]}"
   tar xzf "${KUBE_HOME}/${manifests_tar}" -C "${dst_dir}" --overwrite
-  local -r kube_addon_registry="${KUBE_ADDON_REGISTRY:-k8s.gcr.io}"
-  if [[ "${kube_addon_registry}" != "k8s.gcr.io" ]]; then
-    find "${dst_dir}" \(-name '*.yaml' -or -name '*.yaml.in'\) -print0 | \
-      xargs -0 sed -ri "s@(image:\s.*)k8s.gcr.io@\1${kube_addon_registry}@"
-    find "${dst_dir}" \(-name '*.manifest' -or -name '*.json'\) -print0 | \
-      xargs -0 sed -ri "s@(image\":\s+\")k8s.gcr.io@\1${kube_addon_registry}@"
+  local -r kube_addon_registry="${KUBE_ADDON_REGISTRY:-registry.k8s.io}"
+  if [[ "${kube_addon_registry}" != "registry.k8s.io" ]]; then
+    find "${dst_dir}" \( -name '*.yaml' -or -name '*.yaml.in' \) -print0 | \
+      xargs -0 sed -ri "s@(image:\s.*)registry.k8s.io@\1${kube_addon_registry}@"
+    find "${dst_dir}" \( -name '*.manifest' -or -name '*.json' \) -print0 | \
+      xargs -0 sed -ri "s@(image\":\s+\")registry.k8s.io@\1${kube_addon_registry}@"
   fi
   cp "${dst_dir}/kubernetes/gci-trusty/gci-configure-helper.sh" "${KUBE_BIN}/configure-helper.sh"
   cp "${dst_dir}/kubernetes/gci-trusty/configure-kubeapiserver.sh" "${KUBE_BIN}/configure-kubeapiserver.sh"
   if [[ -e "${dst_dir}/kubernetes/gci-trusty/gke-internal-configure-helper.sh" ]]; then
     cp "${dst_dir}/kubernetes/gci-trusty/gke-internal-configure-helper.sh" "${KUBE_BIN}/"
   fi
-
-  cp "${dst_dir}/kubernetes/gci-trusty/health-monitor.sh" "${KUBE_BIN}/health-monitor.sh"
 
   rm -f "${KUBE_HOME}/${manifests_tar}"
   rm -f "${KUBE_HOME}/${manifests_tar}.sha512"
@@ -457,8 +435,10 @@ function try-load-docker-image {
 
   if [[ "${CONTAINER_RUNTIME_NAME:-}" == "containerd" || "${CONTAINERD_TEST:-}"  == "containerd" ]]; then
     load_image_command=${LOAD_IMAGE_COMMAND:-ctr -n=k8s.io images import}
+    tag_image_command=${TAG_IMAGE_COMMAND:-ctr -n=k8s.io images tag}
   else
     load_image_command="${LOAD_IMAGE_COMMAND:-}"
+    tag_image_command="${TAG_IMAGE_COMMAND:-}"
   fi
 
   # Deliberately word split load_image_command
@@ -472,6 +452,15 @@ function try-load-docker-image {
       sleep 5
     fi
   done
+
+  if [[ -n "${KUBE_ADDON_REGISTRY:-}" ]]; then
+    # remove the prefix and suffix from the path to get the container name
+    container=${img##*/}
+    container=${container%.tar}
+    # find the right one for which we will need an additional tag
+    container=$(ctr -n k8s.io images ls | grep "registry.k8s.io/${container}" | awk '{print $1}' | cut -f 2 -d '/')
+    ${tag_image_command} "registry.k8s.io/${container}" "${KUBE_ADDON_REGISTRY}/${container}"
+  fi
   # Re-enable errexit.
   set -e
 }
@@ -531,11 +520,6 @@ function install-containerd-ubuntu {
   # Override to latest versions of containerd and runc
   systemctl stop containerd
   if [[ -n "${UBUNTU_INSTALL_CONTAINERD_VERSION:-}" ]]; then
-    # TODO(https://github.com/containerd/containerd/issues/2901): Remove this check once containerd has arm64 release.
-    if [[ $(dpkg --print-architecture) != "amd64" ]]; then
-      echo "Unable to automatically install containerd in non-amd64 image. Bailing out..."
-      exit 2
-    fi
     # containerd versions have slightly different url(s), so try both
     # shellcheck disable=SC2086
     ( curl ${CURL_FLAGS} \
@@ -547,11 +531,6 @@ function install-containerd-ubuntu {
     | tar --overwrite -xzv -C /usr/
   fi
   if [[ -n "${UBUNTU_INSTALL_RUNC_VERSION:-}" ]]; then
-    # TODO: Remove this check once runc has arm64 release.
-    if [[ $(dpkg --print-architecture) != "amd64" ]]; then
-      echo "Unable to automatically install runc in non-amd64. Bailing out..."
-      exit 2
-    fi
     # shellcheck disable=SC2086
     curl ${CURL_FLAGS} \
       --location \
@@ -561,10 +540,113 @@ function install-containerd-ubuntu {
   sudo systemctl start containerd
 }
 
-function ensure-container-runtime {
+# If we are on cos we can try to install containerd
+function install-containerd-cos {
+  # bailout if we are not on COS
+  if [ -e /etc/os-release ] && ! grep -q "ID=cos" /etc/os-release; then
+    echo "Unable to automatically install containerd in non-cos image. Bailing out..."
+    exit 2
+  fi
+
+  # Override to latest versions of containerd and runc
+  systemctl stop containerd
+  mkdir -p /home/containerd/
+  mount --bind /home/containerd /home/containerd
+  mount -o remount,exec /home/containerd
+  if [[ -n "${COS_INSTALL_CONTAINERD_VERSION:-}" ]]; then
+    # containerd versions have slightly different url(s), so try both
+    # shellcheck disable=SC2086
+    ( curl ${CURL_FLAGS} \
+        --location \
+        "https://github.com/containerd/containerd/releases/download/${COS_INSTALL_CONTAINERD_VERSION}/containerd-${COS_INSTALL_CONTAINERD_VERSION:1}-${HOST_PLATFORM}-${HOST_ARCH}.tar.gz" \
+      || curl ${CURL_FLAGS} \
+        --location \
+        "https://github.com/containerd/containerd/releases/download/${COS_INSTALL_CONTAINERD_VERSION}/containerd-${COS_INSTALL_CONTAINERD_VERSION:1}.${HOST_PLATFORM}-${HOST_ARCH}.tar.gz" ) \
+    | tar --overwrite -xzv -C /home/containerd/
+    cp /usr/lib/systemd/system/containerd.service /etc/systemd/system/containerd.service
+    # fix the path of the new containerd binary
+    sed -i 's|ExecStart=.*|ExecStart=/home/containerd/bin/containerd|' /etc/systemd/system/containerd.service
+  fi
+  if [[ -n "${COS_INSTALL_RUNC_VERSION:-}" ]]; then
+    # shellcheck disable=SC2086
+    curl ${CURL_FLAGS} \
+      --location \
+      "https://github.com/opencontainers/runc/releases/download/${COS_INSTALL_RUNC_VERSION}/runc.${HOST_ARCH}" --output /home/containerd/bin/runc \
+    && chmod 755 /home/containerd/bin/runc
+    # ensure runc gets picked up from the correct location
+    sed -i "/\[Service\]/a Environment=PATH=/home/containerd/bin:$PATH" /etc/systemd/system/containerd.service
+  fi
+  systemctl daemon-reload
+  sudo systemctl start containerd
+}
+
+function install-auth-provider-gcp {
+  local -r filename="auth-provider-gcp"
+  local -r auth_provider_storage_full_path="${AUTH_PROVIDER_GCP_STORAGE_PATH}/${AUTH_PROVIDER_GCP_VERSION}/${HOST_PLATFORM}_${HOST_ARCH}/${filename}"
+  echo "Downloading auth-provider-gcp ${auth_provider_storage_full_path}" .
+
+  case "${HOST_ARCH}" in
+    amd64)
+      local -r auth_provider_gcp_hash="${AUTH_PROVIDER_GCP_HASH_LINUX_AMD64}"
+      ;;
+    arm64)
+      local -r auth_provider_gcp_hash="${AUTH_PROVIDER_GCP_HASH_LINUX_ARM64}"
+      ;;
+    *)
+      echo "Unrecognized version and platform/arch combination: ${HOST_PLATFORM}/${HOST_ARCH}"
+      exit 1
+  esac
+
+  download-or-bust "${auth_provider_gcp_hash}" "${auth_provider_storage_full_path}"
+
+  mv "${KUBE_HOME}/${filename}" "${AUTH_PROVIDER_GCP_LINUX_BIN_DIR}"
+  chmod a+x "${AUTH_PROVIDER_GCP_LINUX_BIN_DIR}/${filename}"
+
+  cat > "${AUTH_PROVIDER_GCP_LINUX_CONF_FILE}" << EOF
+kind: CredentialProviderConfig
+apiVersion: kubelet.config.k8s.io/v1
+providers:
+  - name: auth-provider-gcp
+    apiVersion: credentialprovider.kubelet.k8s.io/v1
+    matchImages:
+    - "container.cloud.google.com"
+    - "gcr.io"
+    - "*.gcr.io"
+    - "*.pkg.dev"
+    args:
+    - get-credentials
+    - --v=3
+    defaultCacheDuration: 1m
+EOF
+}
+
+function ensure-containerd-runtime {
   # Install containerd/runc if requested
   if [[ -n "${UBUNTU_INSTALL_CONTAINERD_VERSION:-}" || -n "${UBUNTU_INSTALL_RUNC_VERSION:-}" ]]; then
     log-wrap "InstallContainerdUbuntu" install-containerd-ubuntu
+  fi
+  if [[ -n "${COS_INSTALL_CONTAINERD_VERSION:-}" || -n "${COS_INSTALL_RUNC_VERSION:-}" ]]; then
+    log-wrap "InstallContainerdCOS" install-containerd-cos
+  fi
+
+  # Fall back to installing distro specific containerd, if not found
+  if ! command -v containerd >/dev/null 2>&1; then
+    local linuxrelease="cos"
+    if [[ -n "$(command -v lsb_release)" ]]; then
+      linuxrelease=$(lsb_release -si)
+    fi
+    case "${linuxrelease}" in
+      Ubuntu)
+        log-wrap "InstallContainerdUbuntu" install-containerd-ubuntu
+        ;;
+      cos)
+        log-wrap "InstallContainerdCOS" install-containerd-cos
+        ;;
+      *)
+        echo "Installing containerd for linux release ${linuxrelease} not supported" >&2
+        exit 2
+        ;;
+    esac
   fi
 
   # when custom containerd version is installed sourcing containerd_env.sh will add all tools like ctr to the PATH
@@ -588,6 +670,19 @@ function ensure-container-runtime {
     exit 2
   fi
   runc --version
+}
+
+function ensure-container-runtime {
+  case "${CONTAINER_RUNTIME_NAME:-containerd}" in
+    containerd)
+      ensure-containerd-runtime
+      ;;
+    #TODO: Add crio support
+    *)
+      echo "Unsupported container runtime (${CONTAINER_RUNTIME_NAME})." >&2
+      exit 2
+      ;;
+  esac
 }
 
 # Downloads kubernetes binaries and kube-system manifest tarball, unpacks them,
@@ -659,11 +754,19 @@ function install-kube-binary-config {
     log-wrap "RemountFlexVolume" remount-flexvolume-directory "${VOLUME_PLUGIN_DIR}"
   fi
 
+  # When ENABLE_AUTH_PROVIDER_GCP is set, following flags for out-of-tree credential provider for GCP
+  # are presented to kubelet:
+  # --image-credential-provider-config=${path-to-config}
+  # --image-credential-provider-bin-dir=${path-to-auth-provider-binary}
+  # Also, it is required that DisableKubeletCloudCredentialProviders
+  # feature gate is set to true for kubelet to use external credential provider.
+  if [[ "${ENABLE_AUTH_PROVIDER_GCP:-}" == "true" ]]; then
+    # Install out-of-tree auth-provider-gcp binary to enable kubelet to dynamically
+    # retrieve credentials for a container image registry.
+    log-wrap "InstallCredentialProvider" install-auth-provider-gcp
+  fi
   # Install crictl on each node.
   log-wrap "InstallCrictl" install-crictl
-
-  # TODO(awly): include the binary and license in the OS image.
-  log-wrap "InstallExecAuthPlugin" install-exec-auth-plugin
 
   # Clean up.
   rm -rf "${KUBE_HOME}/kubernetes"

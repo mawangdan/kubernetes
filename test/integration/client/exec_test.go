@@ -33,10 +33,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/davecgh/go-spew/spew"
 	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/dump"
 	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -351,9 +351,7 @@ func execPluginClientTests(t *testing.T, unauthorizedCert, unauthorizedKey []byt
 			wantMetrics:                   &execPluginMetrics{},
 		},
 		{
-			// This is not the behavior we would expect, see
-			//   https://github.com/kubernetes/kubernetes/issues/99603
-			name: "good token with static auth cert and key favors exec plugin",
+			name: "good token with static auth cert and key favors static cert",
 			clientConfigFunc: func(c *rest.Config) {
 				c.ExecProvider.Env = []clientcmdapi.ExecEnvVar{
 					{
@@ -370,9 +368,10 @@ func execPluginClientTests(t *testing.T, unauthorizedCert, unauthorizedKey []byt
 				c.CertData = unauthorizedCert
 				c.KeyData = unauthorizedKey
 			},
-			wantAuthorizationHeaderValues: [][]string{{"Bearer " + clientAuthorizedToken}},
+			wantAuthorizationHeaderValues: [][]string{nil},
+			wantClientErrorPrefix:         "Unauthorized",
 			wantCertificate:               x509KeyPair(unauthorizedCert, unauthorizedKey, false),
-			wantMetrics:                   &execPluginMetrics{calls: []execPluginCall{{exitCode: 0, callStatus: "no_error"}}},
+			wantMetrics:                   &execPluginMetrics{},
 		},
 		{
 			name: "unknown binary",
@@ -481,7 +480,7 @@ func TestExecPluginViaClient(t *testing.T) {
 			_, err = client.CoreV1().ConfigMaps("default").List(ctx, metav1.ListOptions{})
 			if test.wantClientErrorPrefix != "" {
 				if err == nil || !strings.HasPrefix(err.Error(), test.wantClientErrorPrefix) {
-					t.Fatalf(`got %q, wanted "%s..."`, err, test.wantClientErrorPrefix)
+					t.Fatalf(`got %v, wanted "%s..."`, err, test.wantClientErrorPrefix)
 				}
 			} else if err != nil {
 				t.Fatal(err)
@@ -563,7 +562,7 @@ type informerSpy struct {
 	deletes []interface{}
 }
 
-func (is *informerSpy) OnAdd(obj interface{}) {
+func (is *informerSpy) OnAdd(obj interface{}, isInInitialList bool) {
 	is.mu.Lock()
 	defer is.mu.Unlock()
 	is.adds = append(is.adds, obj)
@@ -613,7 +612,7 @@ func (is *informerSpy) waitForEvents(t *testing.T, wantEvents bool) {
 			if err != nil {
 				t.Fatalf("wanted no events, but got error: %v", err)
 			} else {
-				t.Fatalf("wanted no events, but got some: %s", spew.Sprintf("%#v", is))
+				t.Fatalf("wanted no events, but got some: %s", dump.Pretty(is))
 			}
 		}
 	}

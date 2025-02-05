@@ -18,10 +18,12 @@ limitations under the License.
 package profile
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
-	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp" //nolint:depguard
+
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/events"
@@ -34,24 +36,24 @@ import (
 type RecorderFactory func(string) events.EventRecorder
 
 // newProfile builds a Profile for the given configuration.
-func newProfile(cfg config.KubeSchedulerProfile, r frameworkruntime.Registry, recorderFact RecorderFactory,
+func newProfile(ctx context.Context, cfg config.KubeSchedulerProfile, r frameworkruntime.Registry, recorderFact RecorderFactory,
 	opts ...frameworkruntime.Option) (framework.Framework, error) {
 	recorder := recorderFact(cfg.SchedulerName)
 	opts = append(opts, frameworkruntime.WithEventRecorder(recorder))
-	return frameworkruntime.NewFramework(r, &cfg, opts...)
+	return frameworkruntime.NewFramework(ctx, r, &cfg, opts...)
 }
 
 // Map holds frameworks indexed by scheduler name.
 type Map map[string]framework.Framework
 
 // NewMap builds the frameworks given by the configuration, indexed by name.
-func NewMap(cfgs []config.KubeSchedulerProfile, r frameworkruntime.Registry, recorderFact RecorderFactory,
+func NewMap(ctx context.Context, cfgs []config.KubeSchedulerProfile, r frameworkruntime.Registry, recorderFact RecorderFactory,
 	opts ...frameworkruntime.Option) (Map, error) {
 	m := make(Map)
 	v := cfgValidator{m: m}
 
 	for _, cfg := range cfgs {
-		p, err := newProfile(cfg, r, recorderFact, opts...)
+		p, err := newProfile(ctx, cfg, r, recorderFact, opts...)
 		if err != nil {
 			return nil, fmt.Errorf("creating profile for scheduler name %s: %v", cfg.SchedulerName, err)
 		}
@@ -67,6 +69,18 @@ func NewMap(cfgs []config.KubeSchedulerProfile, r frameworkruntime.Registry, rec
 func (m Map) HandlesSchedulerName(name string) bool {
 	_, ok := m[name]
 	return ok
+}
+
+// Close closes all frameworks registered in this map.
+func (m Map) Close() error {
+	var errs []error
+	for name, f := range m {
+		err := f.Close()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("framework %s failed to close: %w", name, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // NewRecorderFactory returns a RecorderFactory for the broadcaster.
@@ -98,6 +112,7 @@ func (v *cfgValidator) validate(cfg config.KubeSchedulerProfile, f framework.Fra
 	for _, plCfg := range cfg.PluginConfig {
 		if plCfg.Name == queueSort {
 			queueSortArgs = plCfg.Args
+			break
 		}
 	}
 	if len(v.queueSort) == 0 {

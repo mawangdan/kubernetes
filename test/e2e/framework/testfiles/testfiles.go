@@ -73,7 +73,7 @@ func Read(filePath string) ([]byte, error) {
 	for _, filesource := range filesources {
 		data, err := filesource.ReadTestFile(filePath)
 		if err != nil {
-			return nil, fmt.Errorf("fatal error retrieving test file %s: %s", filePath, err)
+			return nil, fmt.Errorf("fatal error retrieving test file %s: %w", filePath, err)
 		}
 		if data != nil {
 			return data, nil
@@ -81,12 +81,12 @@ func Read(filePath string) ([]byte, error) {
 	}
 	// Here we try to generate an error that points test authors
 	// or users in the right direction for resolving the problem.
-	error := fmt.Sprintf("Test file %q was not found.\n", filePath)
+	err := fmt.Sprintf("Test file %q was not found.\n", filePath)
 	for _, filesource := range filesources {
-		error += filesource.DescribeFiles()
-		error += "\n"
+		err += filesource.DescribeFiles()
+		err += "\n"
 	}
-	return nil, errors.New(error)
+	return nil, errors.New(err)
 }
 
 // Exists checks whether a file could be read. Unexpected errors

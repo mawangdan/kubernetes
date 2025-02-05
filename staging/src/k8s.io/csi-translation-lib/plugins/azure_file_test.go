@@ -23,6 +23,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/klog/v2/ktesting"
+	_ "k8s.io/klog/v2/ktesting/init"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -100,6 +102,7 @@ func TestGetFileShareInfo(t *testing.T) {
 
 func TestTranslateAzureFileInTreeStorageClassToCSI(t *testing.T) {
 	translator := NewAzureFileCSITranslator()
+	logger, _ := ktesting.NewTestContext(t)
 
 	cases := []struct {
 		name         string
@@ -188,7 +191,7 @@ func TestTranslateAzureFileInTreeStorageClassToCSI(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Logf("Testing %v", tc.name)
-		got, err := translator.TranslateInTreeInlineVolumeToCSI(tc.volume, tc.podNamespace)
+		got, err := translator.TranslateInTreeInlineVolumeToCSI(logger, tc.volume, tc.podNamespace)
 		if err != nil && !tc.expErr {
 			t.Errorf("Did not expect error but got: %v", err)
 		}
@@ -205,6 +208,7 @@ func TestTranslateAzureFileInTreeStorageClassToCSI(t *testing.T) {
 
 func TestTranslateAzureFileInTreePVToCSI(t *testing.T) {
 	translator := NewAzureFileCSITranslator()
+	logger, _ := ktesting.NewTestContext(t)
 
 	secretNamespace := "secretnamespace"
 
@@ -221,6 +225,25 @@ func TestTranslateAzureFileInTreePVToCSI(t *testing.T) {
 		{
 			name:   "no azure file volume",
 			volume: &corev1.PersistentVolume{},
+			expErr: true,
+		},
+		{
+			name: "return error if secret namespace could not be found",
+			volume: &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "uuid",
+					Annotations: map[string]string{resourceGroupAnnotation: "rg"},
+				},
+				Spec: corev1.PersistentVolumeSpec{
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						AzureFile: &corev1.AzureFilePersistentVolumeSource{
+							ShareName:  "sharename",
+							SecretName: "secretname",
+							ReadOnly:   true,
+						},
+					},
+				},
+			},
 			expErr: true,
 		},
 		{
@@ -299,11 +322,56 @@ func TestTranslateAzureFileInTreePVToCSI(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "get secret namespace from ClaimRef when it's missing in pv spec source",
+			volume: &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "uuid",
+					Annotations: map[string]string{resourceGroupAnnotation: "rg"},
+				},
+				Spec: corev1.PersistentVolumeSpec{
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						AzureFile: &corev1.AzureFilePersistentVolumeSource{
+							ShareName:  "sharename",
+							SecretName: "secretname",
+							//SecretNamespace: &secretNamespace,
+							ReadOnly: true,
+						},
+					},
+					ClaimRef: &corev1.ObjectReference{
+						Namespace: secretNamespace,
+					},
+				},
+			},
+			expVol: &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "uuid",
+					Annotations: map[string]string{resourceGroupAnnotation: "rg"},
+				},
+				Spec: corev1.PersistentVolumeSpec{
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						CSI: &corev1.CSIPersistentVolumeSource{
+							Driver:   "file.csi.azure.com",
+							ReadOnly: true,
+							NodeStageSecretRef: &corev1.SecretReference{
+								Name:      "secretname",
+								Namespace: secretNamespace,
+							},
+							VolumeAttributes: map[string]string{shareNameField: "sharename"},
+							VolumeHandle:     "rg#secretname#sharename#uuid#secretnamespace",
+						},
+					},
+					ClaimRef: &corev1.ObjectReference{
+						Namespace: secretNamespace,
+					},
+				},
+			},
+		},
 	}
 
 	for _, tc := range cases {
 		t.Logf("Testing %v", tc.name)
-		got, err := translator.TranslateInTreePVToCSI(tc.volume)
+		got, err := translator.TranslateInTreePVToCSI(logger, tc.volume)
 		if err != nil && !tc.expErr {
 			t.Errorf("Did not expect error but got: %v", err)
 		}

@@ -161,7 +161,7 @@ func (plugin *flexVolumePlugin) GetAccessModes() []api.PersistentVolumeAccessMod
 }
 
 // NewMounter is part of the volume.VolumePlugin interface.
-func (plugin *flexVolumePlugin) NewMounter(spec *volume.Spec, pod *api.Pod, _ volume.VolumeOptions) (volume.Mounter, error) {
+func (plugin *flexVolumePlugin) NewMounter(spec *volume.Spec, pod *api.Pod) (volume.Mounter, error) {
 	return plugin.newMounterInternal(spec, pod, plugin.host.GetMounter(plugin.GetPluginName()), plugin.runner)
 }
 
@@ -260,7 +260,7 @@ func (plugin *flexVolumeAttachablePlugin) CanDeviceMount(spec *volume.Spec) (boo
 }
 
 // ConstructVolumeSpec is part of the volume.AttachableVolumePlugin interface.
-func (plugin *flexVolumePlugin) ConstructVolumeSpec(volumeName, mountPath string) (*volume.Spec, error) {
+func (plugin *flexVolumePlugin) ConstructVolumeSpec(volumeName, mountPath string) (volume.ReconstructedVolume, error) {
 	flexVolume := &api.Volume{
 		Name: volumeName,
 		VolumeSource: api.VolumeSource{
@@ -269,7 +269,9 @@ func (plugin *flexVolumePlugin) ConstructVolumeSpec(volumeName, mountPath string
 			},
 		},
 	}
-	return volume.NewSpecFromVolume(flexVolume), nil
+	return volume.ReconstructedVolume{
+		Spec: volume.NewSpecFromVolume(flexVolume),
+	}, nil
 }
 
 func (plugin *flexVolumePlugin) SupportsMountOption() bool {
@@ -283,8 +285,8 @@ func (plugin *flexVolumePlugin) unsupported(commands ...string) {
 	plugin.unsupportedCommands = append(plugin.unsupportedCommands, commands...)
 }
 
-func (plugin *flexVolumePlugin) SupportsBulkVolumeVerification() bool {
-	return false
+func (plugin *flexVolumePlugin) SupportsSELinuxContextMount(spec *volume.Spec) (bool, error) {
+	return false, nil
 }
 
 // Returns true iff the given command is known to be unsupported.

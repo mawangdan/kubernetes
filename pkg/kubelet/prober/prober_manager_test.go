@@ -130,6 +130,88 @@ func TestAddRemovePods(t *testing.T) {
 	}
 }
 
+func TestAddRemovePodsWithRestartableInitContainer(t *testing.T) {
+	m := newTestManager()
+	defer cleanup(t, m)
+	if err := expectProbes(m, nil); err != nil {
+		t.Error(err)
+	}
+
+	testCases := []struct {
+		desc                        string
+		probePaths                  []probeKey
+		hasRestartableInitContainer bool
+	}{
+		{
+			desc:                        "pod without sidecar",
+			probePaths:                  nil,
+			hasRestartableInitContainer: false,
+		},
+		{
+			desc: "pod with sidecar",
+			probePaths: []probeKey{
+				{"restartable_init_container_pod", "restartable-init", liveness},
+				{"restartable_init_container_pod", "restartable-init", readiness},
+				{"restartable_init_container_pod", "restartable-init", startup},
+			},
+			hasRestartableInitContainer: true,
+		},
+	}
+
+	containerRestartPolicy := func(hasRestartableInitContainer bool) *v1.ContainerRestartPolicy {
+		if !hasRestartableInitContainer {
+			return nil
+		}
+		restartPolicy := v1.ContainerRestartPolicyAlways
+		return &restartPolicy
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			probePod := v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					UID: "restartable_init_container_pod",
+				},
+				Spec: v1.PodSpec{
+					InitContainers: []v1.Container{{
+						Name: "init",
+					}, {
+						Name:           "restartable-init",
+						LivenessProbe:  defaultProbe,
+						ReadinessProbe: defaultProbe,
+						StartupProbe:   defaultProbe,
+						RestartPolicy:  containerRestartPolicy(tc.hasRestartableInitContainer),
+					}},
+					Containers: []v1.Container{{
+						Name: "main",
+					}},
+				},
+			}
+
+			// Adding a pod with probes.
+			m.AddPod(&probePod)
+			if err := expectProbes(m, tc.probePaths); err != nil {
+				t.Error(err)
+			}
+
+			// Removing probed pod.
+			m.RemovePod(&probePod)
+			if err := waitForWorkerExit(t, m, tc.probePaths); err != nil {
+				t.Fatal(err)
+			}
+			if err := expectProbes(m, nil); err != nil {
+				t.Error(err)
+			}
+
+			// Removing already removed pods should be a no-op.
+			m.RemovePod(&probePod)
+			if err := expectProbes(m, nil); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+}
+
 func TestCleanupPods(t *testing.T) {
 	m := newTestManager()
 	defer cleanup(t, m)
@@ -293,7 +375,22 @@ func TestUpdatePodStatus(t *testing.T) {
 	m.startupManager.Set(kubecontainer.ParseContainerID(startedNoReadiness.ContainerID), results.Success, &v1.Pod{})
 	m.readinessManager.Set(kubecontainer.ParseContainerID(terminated.ContainerID), results.Success, &v1.Pod{})
 
-	m.UpdatePodStatus(testPodUID, &podStatus)
+	m.UpdatePodStatus(&v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID: testPodUID,
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{Name: unprobed.Name},
+				{Name: probedReady.Name},
+				{Name: probedPending.Name},
+				{Name: probedUnready.Name},
+				{Name: notStartedNoReadiness.Name},
+				{Name: startedNoReadiness.Name},
+				{Name: terminated.Name},
+			},
+		},
+	}, &podStatus)
 
 	expectedReadiness := map[probeKey]bool{
 		{testPodUID, unprobed.Name, readiness}:              true,
@@ -313,6 +410,140 @@ func TestUpdatePodStatus(t *testing.T) {
 			t.Errorf("Unexpected readiness for container %v: Expected %v but got %v",
 				c.Name, expected, c.Ready)
 		}
+	}
+}
+
+func TestUpdatePodStatusWithInitContainers(t *testing.T) {
+	notStarted := v1.ContainerStatus{
+		Name:        "not_started_container",
+		ContainerID: "test://not_started_container_id",
+		State: v1.ContainerState{
+			Running: &v1.ContainerStateRunning{},
+		},
+	}
+	started := v1.ContainerStatus{
+		Name:        "started_container",
+		ContainerID: "test://started_container_id",
+		State: v1.ContainerState{
+			Running: &v1.ContainerStateRunning{},
+		},
+	}
+	terminated := v1.ContainerStatus{
+		Name:        "terminated_container",
+		ContainerID: "test://terminated_container_id",
+		State: v1.ContainerState{
+			Terminated: &v1.ContainerStateTerminated{},
+		},
+	}
+
+	m := newTestManager()
+	// no cleanup: using fake workers.
+
+	// Setup probe "workers" and cached results.
+	m.workers = map[probeKey]*worker{
+		{testPodUID, notStarted.Name, startup}: {},
+		{testPodUID, started.Name, startup}:    {},
+	}
+	m.startupManager.Set(kubecontainer.ParseContainerID(started.ContainerID), results.Success, &v1.Pod{})
+
+	testCases := []struct {
+		desc                        string
+		expectedStartup             map[probeKey]bool
+		expectedReadiness           map[probeKey]bool
+		hasRestartableInitContainer bool
+	}{
+		{
+			desc: "init containers",
+			expectedStartup: map[probeKey]bool{
+				{testPodUID, notStarted.Name, startup}: false,
+				{testPodUID, started.Name, startup}:    true,
+				{testPodUID, terminated.Name, startup}: false,
+			},
+			expectedReadiness: map[probeKey]bool{
+				{testPodUID, notStarted.Name, readiness}: false,
+				{testPodUID, started.Name, readiness}:    false,
+				{testPodUID, terminated.Name, readiness}: true,
+			},
+			hasRestartableInitContainer: false,
+		},
+		{
+			desc: "init container with Always restartPolicy",
+			expectedStartup: map[probeKey]bool{
+				{testPodUID, notStarted.Name, startup}: false,
+				{testPodUID, started.Name, startup}:    true,
+				{testPodUID, terminated.Name, startup}: false,
+			},
+			expectedReadiness: map[probeKey]bool{
+				{testPodUID, notStarted.Name, readiness}: false,
+				{testPodUID, started.Name, readiness}:    true,
+				{testPodUID, terminated.Name, readiness}: false,
+			},
+			hasRestartableInitContainer: true,
+		},
+	}
+
+	containerRestartPolicy := func(enableSidecarContainers bool) *v1.ContainerRestartPolicy {
+		if !enableSidecarContainers {
+			return nil
+		}
+		restartPolicy := v1.ContainerRestartPolicyAlways
+		return &restartPolicy
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			podStatus := v1.PodStatus{
+				Phase: v1.PodRunning,
+				InitContainerStatuses: []v1.ContainerStatus{
+					notStarted, started, terminated,
+				},
+			}
+
+			m.UpdatePodStatus(&v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					UID: testPodUID,
+				},
+				Spec: v1.PodSpec{
+					InitContainers: []v1.Container{
+						{
+							Name:          notStarted.Name,
+							RestartPolicy: containerRestartPolicy(tc.hasRestartableInitContainer),
+						},
+						{
+							Name:          started.Name,
+							RestartPolicy: containerRestartPolicy(tc.hasRestartableInitContainer),
+						},
+						{
+							Name:          terminated.Name,
+							RestartPolicy: containerRestartPolicy(tc.hasRestartableInitContainer),
+						},
+					},
+				},
+			}, &podStatus)
+
+			for _, c := range podStatus.InitContainerStatuses {
+				{
+					expected, ok := tc.expectedStartup[probeKey{testPodUID, c.Name, startup}]
+					if !ok {
+						t.Fatalf("Missing expectation for test case: %v", c.Name)
+					}
+					if expected != *c.Started {
+						t.Errorf("Unexpected startup for container %v: Expected %v but got %v",
+							c.Name, expected, *c.Started)
+					}
+				}
+				{
+					expected, ok := tc.expectedReadiness[probeKey{testPodUID, c.Name, readiness}]
+					if !ok {
+						t.Fatalf("Missing expectation for test case: %v", c.Name)
+					}
+					if expected != c.Ready {
+						t.Errorf("Unexpected readiness for container %v: Expected %v but got %v",
+							c.Name, expected, c.Ready)
+					}
+				}
+			}
+		})
 	}
 }
 

@@ -5,14 +5,17 @@ approvers:
   - derekwaynecarr
   - tallclair
   - yujuhong
+  - klueska
   - sjenning
   - mrunalp
-  - ehashman
   - SergeyKanzhelev
+  - endocrimes
+  - ffromani
 emeritus_approvers:
   - vishh
   - dchen1107
   - dashpole
+  - ehashman
 reviewers:
   - endocrimes
   - sig-node-reviewers

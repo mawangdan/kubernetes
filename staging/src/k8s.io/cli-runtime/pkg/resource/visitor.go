@@ -28,6 +28,7 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/text/encoding/unicode"
 	"golang.org/x/text/transform"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -78,12 +79,16 @@ type Info struct {
 	// defined. If retrieved from the server, the Builder expects the mapping client to
 	// decide the final form. Use the AsVersioned, AsUnstructured, and AsInternal helpers
 	// to alter the object versions.
+	// If Subresource is specified, this will be the object for the subresource.
 	Object runtime.Object
 	// Optional, this is the most recent resource version the server knows about for
 	// this type of resource. It may not match the resource version of the object,
 	// but if set it should be equal to or newer than the resource version of the
 	// object (however the server defines resource version).
 	ResourceVersion string
+	// Optional, if specified, the object is the most recent value of the subresource
+	// returned by the server if available.
+	Subresource string
 }
 
 // Visit implements Visitor
@@ -93,7 +98,7 @@ func (i *Info) Visit(fn VisitorFunc) error {
 
 // Get retrieves the object from the Namespace and Name fields
 func (i *Info) Get() (err error) {
-	obj, err := NewHelper(i.Client, i.Mapping).Get(i.Namespace, i.Name)
+	obj, err := NewHelper(i.Client, i.Mapping).WithSubresource(i.Subresource).Get(i.Namespace, i.Name)
 	if err != nil {
 		if errors.IsNotFound(err) && len(i.Namespace) > 0 && i.Namespace != metav1.NamespaceDefault && i.Namespace != metav1.NamespaceAll {
 			err2 := i.Client.Get().AbsPath("api", "v1", "namespaces", i.Namespace).Do(context.TODO()).Error()
@@ -195,6 +200,33 @@ func (l VisitorList) Visit(fn VisitorFunc) error {
 		}
 	}
 	return nil
+}
+
+type ConcurrentVisitorList struct {
+	visitors    []Visitor
+	concurrency int
+}
+
+func (l ConcurrentVisitorList) Visit(fn VisitorFunc) error {
+	g := errgroup.Group{}
+
+	// Concurrency 1 just runs the visitors sequentially, this is the default
+	// as it preserves the previous behavior, but allows components to opt into
+	// concurrency.
+	concurrency := 1
+	if l.concurrency > concurrency {
+		concurrency = l.concurrency
+	}
+	g.SetLimit(concurrency)
+
+	for i := range l.visitors {
+		i := i
+		g.Go(func() error {
+			return l.visitors[i].Visit(fn)
+		})
+	}
+
+	return g.Wait()
 }
 
 // EagerVisitorList implements Visit for the sub visitors it contains. All errors

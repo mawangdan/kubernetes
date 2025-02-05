@@ -17,23 +17,24 @@ limitations under the License.
 package core
 
 import (
+	"reflect"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apiserver/pkg/admission"
 	quota "k8s.io/apiserver/pkg/quota/v1"
 	"k8s.io/apiserver/pkg/quota/v1/generic"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/kubernetes/pkg/apis/core"
-	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/features"
 )
 
-func testVolumeClaim(name string, namespace string, spec api.PersistentVolumeClaimSpec) *api.PersistentVolumeClaim {
-	return &api.PersistentVolumeClaim{
+func testVolumeClaim(name string, namespace string, spec core.PersistentVolumeClaimSpec) *core.PersistentVolumeClaim {
+	return &core.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 		Spec:       spec,
 	}
@@ -41,7 +42,7 @@ func testVolumeClaim(name string, namespace string, spec api.PersistentVolumeCla
 
 func TestPersistentVolumeClaimEvaluatorUsage(t *testing.T) {
 	classGold := "gold"
-	validClaim := testVolumeClaim("foo", "ns", api.PersistentVolumeClaimSpec{
+	validClaim := testVolumeClaim("foo", "ns", core.PersistentVolumeClaimSpec{
 		Selector: &metav1.LabelSelector{
 			MatchExpressions: []metav1.LabelSelectorRequirement{
 				{
@@ -50,17 +51,17 @@ func TestPersistentVolumeClaimEvaluatorUsage(t *testing.T) {
 				},
 			},
 		},
-		AccessModes: []api.PersistentVolumeAccessMode{
-			api.ReadWriteOnce,
-			api.ReadOnlyMany,
+		AccessModes: []core.PersistentVolumeAccessMode{
+			core.ReadWriteOnce,
+			core.ReadOnlyMany,
 		},
-		Resources: api.ResourceRequirements{
-			Requests: api.ResourceList{
-				api.ResourceName(api.ResourceStorage): resource.MustParse("10Gi"),
+		Resources: core.VolumeResourceRequirements{
+			Requests: core.ResourceList{
+				core.ResourceName(core.ResourceStorage): resource.MustParse("10Gi"),
 			},
 		},
 	})
-	validClaimByStorageClass := testVolumeClaim("foo", "ns", api.PersistentVolumeClaimSpec{
+	validClaimByStorageClass := testVolumeClaim("foo", "ns", core.PersistentVolumeClaimSpec{
 		Selector: &metav1.LabelSelector{
 			MatchExpressions: []metav1.LabelSelectorRequirement{
 				{
@@ -69,27 +70,27 @@ func TestPersistentVolumeClaimEvaluatorUsage(t *testing.T) {
 				},
 			},
 		},
-		AccessModes: []api.PersistentVolumeAccessMode{
-			api.ReadWriteOnce,
-			api.ReadOnlyMany,
+		AccessModes: []core.PersistentVolumeAccessMode{
+			core.ReadWriteOnce,
+			core.ReadOnlyMany,
 		},
-		Resources: api.ResourceRequirements{
-			Requests: api.ResourceList{
-				api.ResourceName(api.ResourceStorage): resource.MustParse("10Gi"),
+		Resources: core.VolumeResourceRequirements{
+			Requests: core.ResourceList{
+				core.ResourceName(core.ResourceStorage): resource.MustParse("10Gi"),
 			},
 		},
 		StorageClassName: &classGold,
 	})
 
 	validClaimWithNonIntegerStorage := validClaim.DeepCopy()
-	validClaimWithNonIntegerStorage.Spec.Resources.Requests[api.ResourceName(api.ResourceStorage)] = resource.MustParse("1001m")
+	validClaimWithNonIntegerStorage.Spec.Resources.Requests[core.ResourceName(core.ResourceStorage)] = resource.MustParse("1001m")
 
 	validClaimByStorageClassWithNonIntegerStorage := validClaimByStorageClass.DeepCopy()
-	validClaimByStorageClassWithNonIntegerStorage.Spec.Resources.Requests[api.ResourceName(api.ResourceStorage)] = resource.MustParse("1001m")
+	validClaimByStorageClassWithNonIntegerStorage.Spec.Resources.Requests[core.ResourceName(core.ResourceStorage)] = resource.MustParse("1001m")
 
 	evaluator := NewPersistentVolumeClaimEvaluator(nil)
 	testCases := map[string]struct {
-		pvc                        *api.PersistentVolumeClaim
+		pvc                        *core.PersistentVolumeClaim
 		usage                      corev1.ResourceList
 		enableRecoverFromExpansion bool
 	}{
@@ -155,7 +156,7 @@ func TestPersistentVolumeClaimEvaluatorUsage(t *testing.T) {
 	}
 	for testName, testCase := range testCases {
 		t.Run(testName, func(t *testing.T) {
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.RecoverVolumeExpansionFailure, testCase.enableRecoverFromExpansion)()
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.RecoverVolumeExpansionFailure, testCase.enableRecoverFromExpansion)
 			actual, err := evaluator.Usage(testCase.pvc)
 			if err != nil {
 				t.Errorf("%s unexpected error: %v", testName, err)
@@ -168,16 +169,107 @@ func TestPersistentVolumeClaimEvaluatorUsage(t *testing.T) {
 	}
 }
 
-func getPVCWithAllocatedResource(pvcSize, allocatedSize string) *api.PersistentVolumeClaim {
-	validPVCWithAllocatedResources := testVolumeClaim("foo", "ns", api.PersistentVolumeClaimSpec{
-		Resources: api.ResourceRequirements{
-			Requests: api.ResourceList{
+func getPVCWithAllocatedResource(pvcSize, allocatedSize string) *core.PersistentVolumeClaim {
+	validPVCWithAllocatedResources := testVolumeClaim("foo", "ns", core.PersistentVolumeClaimSpec{
+		Resources: core.VolumeResourceRequirements{
+			Requests: core.ResourceList{
 				core.ResourceStorage: resource.MustParse(pvcSize),
 			},
 		},
 	})
-	validPVCWithAllocatedResources.Status.AllocatedResources = api.ResourceList{
-		api.ResourceName(api.ResourceStorage): resource.MustParse(allocatedSize),
+	validPVCWithAllocatedResources.Status.AllocatedResources = core.ResourceList{
+		core.ResourceName(core.ResourceStorage): resource.MustParse(allocatedSize),
 	}
 	return validPVCWithAllocatedResources
+}
+
+func TestPersistentVolumeClaimEvaluatorMatchingResources(t *testing.T) {
+	evaluator := NewPersistentVolumeClaimEvaluator(nil)
+	testCases := map[string]struct {
+		items []corev1.ResourceName
+		want  []corev1.ResourceName
+	}{
+		"supported-resources": {
+			items: []corev1.ResourceName{
+				"count/persistentvolumeclaims",
+				"requests.storage",
+				"persistentvolumeclaims",
+				"gold.storageclass.storage.k8s.io/requests.storage",
+				"gold.storageclass.storage.k8s.io/persistentvolumeclaims",
+			},
+
+			want: []corev1.ResourceName{
+				"count/persistentvolumeclaims",
+				"requests.storage",
+				"persistentvolumeclaims",
+				"gold.storageclass.storage.k8s.io/requests.storage",
+				"gold.storageclass.storage.k8s.io/persistentvolumeclaims",
+			},
+		},
+		"unsupported-resources": {
+			items: []corev1.ResourceName{
+				"storage",
+				"ephemeral-storage",
+				"bronze.storageclass.storage.k8s.io/storage",
+				"gold.storage.k8s.io/requests.storage",
+			},
+			want: []corev1.ResourceName{},
+		},
+	}
+	for testName, testCase := range testCases {
+		actual := evaluator.MatchingResources(testCase.items)
+
+		if !reflect.DeepEqual(testCase.want, actual) {
+			t.Errorf("%s expected:\n%v\n, actual:\n%v", testName, testCase.want, actual)
+		}
+	}
+}
+
+func TestPersistentVolumeClaimEvaluatorHandles(t *testing.T) {
+	evaluator := NewPersistentVolumeClaimEvaluator(nil)
+	testCases := []struct {
+		name  string
+		attrs admission.Attributes
+		want  bool
+	}{
+		{
+			name:  "create",
+			attrs: admission.NewAttributesRecord(nil, nil, schema.GroupVersionKind{Group: "core", Version: "v1", Kind: "Pod"}, "", "", schema.GroupVersionResource{Group: "core", Version: "v1", Resource: "pods"}, "", admission.Create, nil, false, nil),
+			want:  true,
+		},
+		{
+			name:  "update",
+			attrs: admission.NewAttributesRecord(nil, nil, schema.GroupVersionKind{Group: "core", Version: "v1", Kind: "Pod"}, "", "", schema.GroupVersionResource{Group: "core", Version: "v1", Resource: "pods"}, "", admission.Update, nil, false, nil),
+			want:  true,
+		},
+		{
+			name:  "delete",
+			attrs: admission.NewAttributesRecord(nil, nil, schema.GroupVersionKind{Group: "core", Version: "v1", Kind: "Pod"}, "", "", schema.GroupVersionResource{Group: "core", Version: "v1", Resource: "pods"}, "", admission.Delete, nil, false, nil),
+			want:  false,
+		},
+		{
+			name:  "connect",
+			attrs: admission.NewAttributesRecord(nil, nil, schema.GroupVersionKind{Group: "core", Version: "v1", Kind: "Pod"}, "", "", schema.GroupVersionResource{Group: "core", Version: "v1", Resource: "pods"}, "", admission.Connect, nil, false, nil),
+			want:  false,
+		},
+		{
+			name:  "create-subresource",
+			attrs: admission.NewAttributesRecord(nil, nil, schema.GroupVersionKind{Group: "core", Version: "v1", Kind: "Pod"}, "", "", schema.GroupVersionResource{Group: "core", Version: "v1", Resource: "pods"}, "subresource", admission.Create, nil, false, nil),
+			want:  false,
+		},
+		{
+			name:  "update-subresource",
+			attrs: admission.NewAttributesRecord(nil, nil, schema.GroupVersionKind{Group: "core", Version: "v1", Kind: "Pod"}, "", "", schema.GroupVersionResource{Group: "core", Version: "v1", Resource: "pods"}, "subresource", admission.Update, nil, false, nil),
+			want:  false,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			actual := evaluator.Handles(tc.attrs)
+
+			if tc.want != actual {
+				t.Errorf("%s expected:\n%v\n, actual:\n%v", tc.name, tc.want, actual)
+			}
+		})
+	}
 }
