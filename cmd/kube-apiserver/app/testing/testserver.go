@@ -18,12 +18,21 @@ package testing
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
+	"math"
+	"math/big"
 	"net"
 	"os"
-	"path"
 	"path/filepath"
 	"runtime"
+	"testing"
 	"time"
 
 	"github.com/spf13/pflag"
@@ -35,17 +44,37 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/apiserver/pkg/registry/generic/registry"
+	serveroptions "k8s.io/apiserver/pkg/server/options"
 	"k8s.io/apiserver/pkg/storage/storagebackend"
 	"k8s.io/apiserver/pkg/storageversion"
+	"k8s.io/apiserver/pkg/util/compatibility"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
+	clientgotransport "k8s.io/client-go/transport"
 	"k8s.io/client-go/util/cert"
+	"k8s.io/client-go/util/keyutil"
+	basecompatibility "k8s.io/component-base/compatibility"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	logsapi "k8s.io/component-base/logs/api/v1"
+	zpagesfeatures "k8s.io/component-base/zpages/features"
+	"k8s.io/component-base/zpages/flagz"
+	"k8s.io/klog/v2"
 	"k8s.io/kube-aggregator/pkg/apiserver"
+	"k8s.io/kubernetes/pkg/features"
+	testutil "k8s.io/kubernetes/test/utils"
+	"k8s.io/kubernetes/test/utils/ktesting"
+
 	"k8s.io/kubernetes/cmd/kube-apiserver/app"
 	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
-	testutil "k8s.io/kubernetes/test/utils"
 )
+
+func init() {
+	// If instantiated more than once or together with other servers, the
+	// servers would try to modify the global logging state. This must get
+	// ignored during testing.
+	logsapi.ReapplyHandling = logsapi.ReapplyHandlingIgnoreUnchanged
+}
 
 // This key is for testing purposes only and is not considered secure.
 const ecdsaPrivateKey = `-----BEGIN EC PRIVATE KEY-----
@@ -59,12 +88,26 @@ type TearDownFunc func()
 
 // TestServerInstanceOptions Instance options the TestServer
 type TestServerInstanceOptions struct {
-	// DisableStorageCleanup Disable the automatic storage cleanup
-	DisableStorageCleanup bool
+	// SkipHealthzCheck returns without waiting for the server to become healthy.
+	// Useful for testing server configurations expected to prevent /healthz from completing.
+	SkipHealthzCheck bool
 	// Enable cert-auth for the kube-apiserver
 	EnableCertAuth bool
 	// Wrap the storage version interface of the created server's generic server.
 	StorageVersionWrapFunc func(storageversion.Manager) storageversion.Manager
+	// CA file used for requestheader authn during communication between:
+	// 1. kube-apiserver and peer when the local apiserver is not able to serve the request due
+	// to version skew
+	// 2. kube-apiserver and aggregated apiserver
+
+	// We specify this as on option to pass a common proxyCA to multiple apiservers to simulate
+	// an apiserver version skew scenario where all apiservers use the same proxyCA to verify client connections.
+	ProxyCA *ProxyCA
+	// Set the BinaryVersion of server effective version.
+	// If empty, effective version will default to DefaultKubeEffectiveVersion.
+	BinaryVersion string
+	// Set non-default request timeout in the server.
+	RequestTimeout time.Duration
 }
 
 // TestServer return values supplied by kube-test-ApiServer
@@ -79,16 +122,26 @@ type TestServer struct {
 
 // Logger allows t.Testing and b.Testing to be passed to StartTestServer and StartTestServerOrDie
 type Logger interface {
+	Helper()
 	Errorf(format string, args ...interface{})
 	Fatalf(format string, args ...interface{})
 	Logf(format string, args ...interface{})
+	Cleanup(func())
+}
+
+// ProxyCA contains the certificate authority certificate and key which is used to verify client connections
+// to kube-apiservers. The clients can be :
+// 1. aggregated apiservers
+// 2. peer kube-apiservers
+type ProxyCA struct {
+	ProxySigningCert *x509.Certificate
+	ProxySigningKey  *rsa.PrivateKey
 }
 
 // NewDefaultTestServerOptions Default options for TestServer instances
 func NewDefaultTestServerOptions() *TestServerInstanceOptions {
 	return &TestServerInstanceOptions{
-		DisableStorageCleanup: false,
-		EnableCertAuth:        true,
+		EnableCertAuth: true,
 	}
 }
 
@@ -96,29 +149,39 @@ func NewDefaultTestServerOptions() *TestServerInstanceOptions {
 // and location of the tmpdir are returned.
 //
 // Note: we return a tear-down func instead of a stop channel because the later will leak temporary
-// 		 files that because Golang testing's call to os.Exit will not give a stop channel go routine
-// 		 enough time to remove temporary files.
-func StartTestServer(t Logger, instanceOptions *TestServerInstanceOptions, customFlags []string, storageConfig *storagebackend.Config) (result TestServer, err error) {
+// files that because Golang testing's call to os.Exit will not give a stop channel go routine
+// enough time to remove temporary files.
+func StartTestServer(t ktesting.TB, instanceOptions *TestServerInstanceOptions, customFlags []string, storageConfig *storagebackend.Config) (result TestServer, err error) {
+	// Some callers may have initialize ktesting already.
+	tCtx, ok := t.(ktesting.TContext)
+	if !ok {
+		tCtx = ktesting.Init(t)
+	}
+
 	if instanceOptions == nil {
 		instanceOptions = NewDefaultTestServerOptions()
 	}
 
-	// TODO : Remove TrackStorageCleanup below when PR
-	// https://github.com/kubernetes/kubernetes/pull/50690
-	// merges as that shuts down storage properly
-	if !instanceOptions.DisableStorageCleanup {
-		registry.TrackStorageCleanup()
+	result.TmpDir, err = os.MkdirTemp("", "kubernetes-kube-apiserver")
+	if err != nil {
+		return result, fmt.Errorf("failed to create temp dir: %v", err)
 	}
 
-	stopCh := make(chan struct{})
+	var errCh chan error
 	tearDown := func() {
-		if !instanceOptions.DisableStorageCleanup {
-			registry.CleanupStorage()
+		// Cancel is stopping apiserver and cleaning up
+		// after itself, including shutting down its storage layer.
+		tCtx.Cancel("tearing down")
+
+		// If the apiserver was started, let's wait for it to
+		// shutdown clearly.
+		if errCh != nil {
+			err, ok := <-errCh
+			if ok && err != nil {
+				klog.Errorf("Failed to shutdown test server clearly: %v", err)
+			}
 		}
-		close(stopCh)
-		if len(result.TmpDir) != 0 {
-			os.RemoveAll(result.TmpDir)
-		}
+		os.RemoveAll(result.TmpDir)
 	}
 	defer func() {
 		if result.TearDownFn == nil {
@@ -126,15 +189,28 @@ func StartTestServer(t Logger, instanceOptions *TestServerInstanceOptions, custo
 		}
 	}()
 
-	result.TmpDir, err = os.MkdirTemp("", "kubernetes-kube-apiserver")
-	if err != nil {
-		return result, fmt.Errorf("failed to create temp dir: %v", err)
-	}
-
 	fs := pflag.NewFlagSet("test", pflag.PanicOnError)
 
+	featureGate := utilfeature.DefaultMutableFeatureGate.DeepCopy()
+	effectiveVersion := compatibility.DefaultKubeEffectiveVersionForTest()
+	if instanceOptions.BinaryVersion != "" {
+		effectiveVersion = basecompatibility.NewEffectiveVersionFromString(instanceOptions.BinaryVersion, "", "")
+	}
+	effectiveVersion.SetEmulationVersion(featureGate.EmulationVersion())
+	componentGlobalsRegistry := basecompatibility.NewComponentGlobalsRegistry()
+	if err := componentGlobalsRegistry.Register(basecompatibility.DefaultKubeComponent, effectiveVersion, featureGate); err != nil {
+		return result, err
+	}
+
 	s := options.NewServerRunOptions()
-	for _, f := range s.Flags().FlagSets {
+	// set up new instance of ComponentGlobalsRegistry instead of using the DefaultComponentGlobalsRegistry to avoid contention in parallel tests.
+	s.Options.GenericServerRunOptions.ComponentGlobalsRegistry = componentGlobalsRegistry
+	if instanceOptions.RequestTimeout > 0 {
+		s.GenericServerRunOptions.RequestTimeout = instanceOptions.RequestTimeout
+	}
+
+	namedFlagSets := s.Flags()
+	for _, f := range namedFlagSets.FlagSets {
 		fs.AddFlagSet(f)
 	}
 
@@ -144,21 +220,100 @@ func StartTestServer(t Logger, instanceOptions *TestServerInstanceOptions, custo
 	}
 	s.SecureServing.ServerCert.CertDirectory = result.TmpDir
 
+	reqHeaderFromFlags := s.Authentication.RequestHeader
 	if instanceOptions.EnableCertAuth {
-		// create certificates for aggregation and client-cert auth
-		proxySigningKey, err := testutil.NewPrivateKey()
-		if err != nil {
-			return result, err
+		// set up default headers for request header auth
+		reqHeaders := serveroptions.NewDelegatingAuthenticationOptions()
+		s.Authentication.RequestHeader = &reqHeaders.RequestHeader
+
+		var proxySigningKey *rsa.PrivateKey
+		var proxySigningCert *x509.Certificate
+
+		if instanceOptions.ProxyCA != nil {
+			// use provided proxyCA
+			proxySigningKey = instanceOptions.ProxyCA.ProxySigningKey
+			proxySigningCert = instanceOptions.ProxyCA.ProxySigningCert
+
+		} else {
+			// create certificates for aggregation and client-cert auth
+			proxySigningKey, err = testutil.NewPrivateKey()
+			if err != nil {
+				return result, err
+			}
+			proxySigningCert, err = cert.NewSelfSignedCACert(cert.Config{CommonName: "front-proxy-ca"}, proxySigningKey)
+			if err != nil {
+				return result, err
+			}
 		}
-		proxySigningCert, err := cert.NewSelfSignedCACert(cert.Config{CommonName: "front-proxy-ca"}, proxySigningKey)
-		if err != nil {
-			return result, err
-		}
-		proxyCACertFile := path.Join(s.SecureServing.ServerCert.CertDirectory, "proxy-ca.crt")
+		proxyCACertFile := filepath.Join(s.SecureServing.ServerCert.CertDirectory, "proxy-ca.crt")
 		if err := os.WriteFile(proxyCACertFile, testutil.EncodeCertPEM(proxySigningCert), 0644); err != nil {
 			return result, err
 		}
 		s.Authentication.RequestHeader.ClientCAFile = proxyCACertFile
+
+		// give the kube api server an "identity" it can use to for request header auth
+		// so that aggregated api servers can understand who the calling user is
+		s.Authentication.RequestHeader.AllowedNames = []string{"ash", "misty", "brock"}
+
+		// create private key
+		signer, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			return result, err
+		}
+
+		// make a client certificate for the api server - common name has to match one of our defined names above
+		serial, err := rand.Int(rand.Reader, new(big.Int).SetInt64(math.MaxInt64-1))
+		if err != nil {
+			return result, err
+		}
+		serial = new(big.Int).Add(serial, big.NewInt(1))
+		tenThousandHoursLater := time.Now().Add(10_000 * time.Hour)
+		certTmpl := x509.Certificate{
+			Subject: pkix.Name{
+				CommonName: "misty",
+			},
+			SerialNumber: serial,
+			NotBefore:    proxySigningCert.NotBefore,
+			NotAfter:     tenThousandHoursLater,
+			KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+			ExtKeyUsage: []x509.ExtKeyUsage{
+				x509.ExtKeyUsageClientAuth,
+			},
+			BasicConstraintsValid: true,
+		}
+		certDERBytes, err := x509.CreateCertificate(rand.Reader, &certTmpl, proxySigningCert, signer.Public(), proxySigningKey)
+		if err != nil {
+			return result, err
+		}
+		clientCrtOfAPIServer, err := x509.ParseCertificate(certDERBytes)
+		if err != nil {
+			return result, err
+		}
+
+		// write the cert to disk
+		certificatePath := filepath.Join(s.SecureServing.ServerCert.CertDirectory, "misty-crt.crt")
+		certBlock := pem.Block{
+			Type:  "CERTIFICATE",
+			Bytes: clientCrtOfAPIServer.Raw,
+		}
+		certBytes := pem.EncodeToMemory(&certBlock)
+		if err := cert.WriteCert(certificatePath, certBytes); err != nil {
+			return result, err
+		}
+
+		// write the key to disk
+		privateKeyPath := filepath.Join(s.SecureServing.ServerCert.CertDirectory, "misty-crt.key")
+		encodedPrivateKey, err := keyutil.MarshalPrivateKeyToPEM(signer)
+		if err != nil {
+			return result, err
+		}
+		if err := keyutil.WriteKey(privateKeyPath, encodedPrivateKey); err != nil {
+			return result, err
+		}
+
+		s.ProxyClientKeyFile = filepath.Join(s.SecureServing.ServerCert.CertDirectory, "misty-crt.key")
+		s.ProxyClientCertFile = filepath.Join(s.SecureServing.ServerCert.CertDirectory, "misty-crt.crt")
+
 		clientSigningKey, err := testutil.NewPrivateKey()
 		if err != nil {
 			return result, err
@@ -167,7 +322,7 @@ func StartTestServer(t Logger, instanceOptions *TestServerInstanceOptions, custo
 		if err != nil {
 			return result, err
 		}
-		clientCACertFile := path.Join(s.SecureServing.ServerCert.CertDirectory, "client-ca.crt")
+		clientCACertFile := filepath.Join(s.SecureServing.ServerCert.CertDirectory, "client-ca.crt")
 		if err := os.WriteFile(clientCACertFile, testutil.EncodeCertPEM(clientSigningCert), 0644); err != nil {
 			return result, err
 		}
@@ -184,10 +339,57 @@ func StartTestServer(t Logger, instanceOptions *TestServerInstanceOptions, custo
 
 	s.ServiceClusterIPRanges = "10.0.0.0/16"
 	s.Etcd.StorageConfig = *storageConfig
-	s.APIEnablement.RuntimeConfig.Set("api/all=true")
 
 	if err := fs.Parse(customFlags); err != nil {
 		return result, err
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(zpagesfeatures.ComponentFlagz) {
+		s.Flagz = flagz.NamedFlagSetsReader{FlagSets: namedFlagSets}
+	}
+
+	// the RequestHeader options pointer gets replaced in the case of EnableCertAuth override
+	// and so flags are connected to a struct that no longer appears in the ServerOptions struct
+	// we're using.
+	// We still want to make it possible to configure the headers config for the RequestHeader authenticator.
+	if usernameHeaders := reqHeaderFromFlags.UsernameHeaders; len(usernameHeaders) > 0 {
+		s.Authentication.RequestHeader.UsernameHeaders = usernameHeaders
+	}
+	if uidHeaders := reqHeaderFromFlags.UIDHeaders; len(uidHeaders) > 0 {
+		s.Authentication.RequestHeader.UIDHeaders = uidHeaders
+	}
+	if groupHeaders := reqHeaderFromFlags.GroupHeaders; len(groupHeaders) > 0 {
+		s.Authentication.RequestHeader.GroupHeaders = groupHeaders
+	}
+	if extraHeaders := reqHeaderFromFlags.ExtraHeaderPrefixes; len(extraHeaders) > 0 {
+		s.Authentication.RequestHeader.ExtraHeaderPrefixes = extraHeaders
+	}
+
+	if err := componentGlobalsRegistry.Set(); err != nil {
+		return result, fmt.Errorf("%w\nIf you are using SetFeatureGate*DuringTest, try using --emulated-version and --feature-gates flags instead", err)
+	}
+	// If the local ComponentGlobalsRegistry is changed by the flags,
+	// we need to copy the new feature values back to the DefaultFeatureGate because most feature checks still use the DefaultFeatureGate.
+	// We cannot directly use DefaultFeatureGate in ComponentGlobalsRegistry because the changes done by ComponentGlobalsRegistry.Set() will not be undone at the end of the test.
+	if !featureGate.EmulationVersion().EqualTo(utilfeature.DefaultMutableFeatureGate.EmulationVersion()) {
+		featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultMutableFeatureGate, effectiveVersion.EmulationVersion())
+	}
+	for f := range utilfeature.DefaultMutableFeatureGate.GetAll() {
+		if featureGate.Enabled(f) != utilfeature.DefaultFeatureGate.Enabled(f) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, f, featureGate.Enabled(f))
+		}
+	}
+	utilfeature.DefaultMutableFeatureGate.AddMetrics()
+
+	if instanceOptions.EnableCertAuth {
+		if featureGate.Enabled(features.UnknownVersionInteroperabilityProxy) {
+			// TODO: set up a general clean up for testserver
+			if clientgotransport.DialerStopCh == wait.NeverStop {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+				t.Cleanup(cancel)
+				clientgotransport.DialerStopCh = ctx.Done()
+			}
+			s.PeerCAFile = filepath.Join(s.SecureServing.ServerCert.CertDirectory, s.SecureServing.ServerCert.PairName+".crt")
+		}
 	}
 
 	saSigningKeyFile, err := os.CreateTemp("/tmp", "insecure_test_key")
@@ -202,7 +404,7 @@ func StartTestServer(t Logger, instanceOptions *TestServerInstanceOptions, custo
 	s.Authentication.ServiceAccounts.Issuers = []string{"https://foo.bar.example.com"}
 	s.Authentication.ServiceAccounts.KeyFiles = []string{saSigningKeyFile.Name()}
 
-	completedOptions, err := app.Complete(s)
+	completedOptions, err := s.Complete(tCtx)
 	if err != nil {
 		return result, fmt.Errorf("failed to set default ServerRunOptions: %v", err)
 	}
@@ -213,7 +415,16 @@ func StartTestServer(t Logger, instanceOptions *TestServerInstanceOptions, custo
 
 	t.Logf("runtime-config=%v", completedOptions.APIEnablement.RuntimeConfig)
 	t.Logf("Starting kube-apiserver on port %d...", s.SecureServing.BindPort)
-	server, err := app.CreateServerChain(completedOptions, stopCh)
+
+	config, err := app.NewConfig(completedOptions)
+	if err != nil {
+		return result, err
+	}
+	completed, err := config.Complete()
+	if err != nil {
+		return result, err
+	}
+	server, err := app.CreateServerChain(completed)
 	if err != nil {
 		return result, fmt.Errorf("failed to create server chain: %v", err)
 	}
@@ -221,50 +432,53 @@ func StartTestServer(t Logger, instanceOptions *TestServerInstanceOptions, custo
 		server.GenericAPIServer.StorageVersionManager = instanceOptions.StorageVersionWrapFunc(server.GenericAPIServer.StorageVersionManager)
 	}
 
-	errCh := make(chan error)
-	go func(stopCh <-chan struct{}) {
+	errCh = make(chan error)
+	go func() {
+		defer close(errCh)
 		prepared, err := server.PrepareRun()
 		if err != nil {
 			errCh <- err
-		} else if err := prepared.Run(stopCh); err != nil {
+		} else if err := prepared.Run(tCtx); err != nil {
 			errCh <- err
 		}
-	}(stopCh)
-
-	t.Logf("Waiting for /healthz to be ok...")
+	}()
 
 	client, err := kubernetes.NewForConfig(server.GenericAPIServer.LoopbackClientConfig)
 	if err != nil {
 		return result, fmt.Errorf("failed to create a client: %v", err)
 	}
 
-	// wait until healthz endpoint returns ok
-	err = wait.Poll(100*time.Millisecond, time.Minute, func() (bool, error) {
-		select {
-		case err := <-errCh:
-			return false, err
-		default:
-		}
+	if !instanceOptions.SkipHealthzCheck {
+		t.Logf("Waiting for /healthz to be ok...")
 
-		req := client.CoreV1().RESTClient().Get().AbsPath("/healthz")
-		// The storage version bootstrap test wraps the storage version post-start
-		// hook, so the hook won't become health when the server bootstraps
-		if instanceOptions.StorageVersionWrapFunc != nil {
-			// We hardcode the param instead of having a new instanceOptions field
-			// to avoid confusing users with more options.
-			storageVersionCheck := fmt.Sprintf("poststarthook/%s", apiserver.StorageVersionPostStartHookName)
-			req.Param("exclude", storageVersionCheck)
+		// wait until healthz endpoint returns ok
+		err = wait.Poll(100*time.Millisecond, time.Minute, func() (bool, error) {
+			select {
+			case err := <-errCh:
+				return false, err
+			default:
+			}
+
+			req := client.CoreV1().RESTClient().Get().AbsPath("/healthz")
+			// The storage version bootstrap test wraps the storage version post-start
+			// hook, so the hook won't become health when the server bootstraps
+			if instanceOptions.StorageVersionWrapFunc != nil {
+				// We hardcode the param instead of having a new instanceOptions field
+				// to avoid confusing users with more options.
+				storageVersionCheck := fmt.Sprintf("poststarthook/%s", apiserver.StorageVersionPostStartHookName)
+				req.Param("exclude", storageVersionCheck)
+			}
+			result := req.Do(context.TODO())
+			status := 0
+			result.StatusCode(&status)
+			if status == 200 {
+				return true, nil
+			}
+			return false, nil
+		})
+		if err != nil {
+			return result, fmt.Errorf("failed to wait for /healthz to return ok: %v", err)
 		}
-		result := req.Do(context.TODO())
-		status := 0
-		result.StatusCode(&status)
-		if status == 200 {
-			return true, nil
-		}
-		return false, nil
-	})
-	if err != nil {
-		return result, fmt.Errorf("failed to wait for /healthz to return ok: %v", err)
 	}
 
 	// wait until default namespace is created
@@ -314,7 +528,10 @@ func StartTestServer(t Logger, instanceOptions *TestServerInstanceOptions, custo
 	result.ClientConfig.QPS = 1000
 	result.ClientConfig.Burst = 10000
 	result.ServerOpts = s
-	result.TearDownFn = tearDown
+	result.TearDownFn = func() {
+		tearDown()
+		etcdClient.Close()
+	}
 	result.EtcdClient = etcdClient
 	result.EtcdStoragePrefix = storageConfig.Prefix
 
@@ -322,7 +539,7 @@ func StartTestServer(t Logger, instanceOptions *TestServerInstanceOptions, custo
 }
 
 // StartTestServerOrDie calls StartTestServer t.Fatal if it does not succeed.
-func StartTestServerOrDie(t Logger, instanceOptions *TestServerInstanceOptions, flags []string, storageConfig *storagebackend.Config) *TestServer {
+func StartTestServerOrDie(t testing.TB, instanceOptions *TestServerInstanceOptions, flags []string, storageConfig *storagebackend.Config) *TestServer {
 	result, err := StartTestServer(t, instanceOptions, flags, storageConfig)
 	if err == nil {
 		return &result

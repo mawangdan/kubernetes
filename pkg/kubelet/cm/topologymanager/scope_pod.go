@@ -22,6 +22,7 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/cm/admission"
 	"k8s.io/kubernetes/pkg/kubelet/cm/containermap"
 	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
+	"k8s.io/kubernetes/pkg/kubelet/metrics"
 )
 
 type podScope struct {
@@ -44,14 +45,10 @@ func NewPodScope(policy Policy) Scope {
 }
 
 func (s *podScope) Admit(pod *v1.Pod) lifecycle.PodAdmitResult {
-	// Exception - Policy : none
-	if s.policy.Name() == PolicyNone {
-		return s.admitPolicyNone(pod)
-	}
-
 	bestHint, admit := s.calculateAffinity(pod)
 	klog.InfoS("Best TopologyHint", "bestHint", bestHint, "pod", klog.KObj(pod))
 	if !admit {
+		metrics.TopologyManagerAdmissionErrorsTotal.Inc()
 		return admission.GetPodAdmitResult(&TopologyAffinityError{})
 	}
 
@@ -61,8 +58,13 @@ func (s *podScope) Admit(pod *v1.Pod) lifecycle.PodAdmitResult {
 
 		err := s.allocateAlignedResources(pod, &container)
 		if err != nil {
+			metrics.TopologyManagerAdmissionErrorsTotal.Inc()
 			return admission.GetPodAdmitResult(err)
 		}
+	}
+	if IsAlignmentGuaranteed(s.policy) {
+		// increment only if we know we allocate aligned resources.
+		metrics.ContainerAlignedComputeResources.WithLabelValues(metrics.AlignScopePod, metrics.AlignedNUMANode).Inc()
 	}
 	return admission.GetPodAdmitResult(nil)
 }

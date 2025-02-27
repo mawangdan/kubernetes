@@ -17,8 +17,8 @@ FROM ${RUNNERIMAGE}
 
 EXPOSE 2379 2380 4001 7001
 
+WORKDIR C:/usr/local/bin
 COPY etcd* etcdctl* /usr/local/bin/
-COPY cp* /usr/local/bin/
 COPY migrate-if-needed.bat /usr/local/bin/
 COPY migrate /usr/local/bin/migrate.exe
 

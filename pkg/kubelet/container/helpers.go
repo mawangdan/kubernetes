@@ -17,6 +17,7 @@ limitations under the License.
 package container
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -39,13 +40,13 @@ import (
 
 // HandlerRunner runs a lifecycle handler for a container.
 type HandlerRunner interface {
-	Run(containerID ContainerID, pod *v1.Pod, container *v1.Container, handler *v1.LifecycleHandler) (string, error)
+	Run(ctx context.Context, containerID ContainerID, pod *v1.Pod, container *v1.Container, handler *v1.LifecycleHandler) (string, error)
 }
 
 // RuntimeHelper wraps kubelet to make container runtime
 // able to get necessary informations like the RunContainerOptions, DNS settings, Host IP.
 type RuntimeHelper interface {
-	GenerateRunContainerOptions(pod *v1.Pod, container *v1.Container, podIP string, podIPs []string) (contOpts *RunContainerOptions, cleanupAction func(), err error)
+	GenerateRunContainerOptions(ctx context.Context, pod *v1.Pod, container *v1.Container, podIP string, podIPs []string, imageVolumes ImageVolumes) (contOpts *RunContainerOptions, cleanupAction func(), err error)
 	GetPodDNS(pod *v1.Pod) (dnsConfig *runtimeapi.DNSConfig, err error)
 	// GetPodCgroupParent returns the CgroupName identifier, and its literal cgroupfs form on the host
 	// of a pod.
@@ -56,6 +57,18 @@ type RuntimeHelper interface {
 	// supplemental groups for the Pod. These extra supplemental groups come
 	// from annotations on persistent volumes that the pod depends on.
 	GetExtraSupplementalGroupsForPod(pod *v1.Pod) []int64
+
+	// GetOrCreateUserNamespaceMappings returns the configuration for the sandbox user namespace
+	GetOrCreateUserNamespaceMappings(pod *v1.Pod, runtimeHandler string) (*runtimeapi.UserNamespace, error)
+
+	// PrepareDynamicResources prepares resources for a pod.
+	PrepareDynamicResources(ctx context.Context, pod *v1.Pod) error
+
+	// UnprepareDynamicResources unprepares resources for a a pod.
+	UnprepareDynamicResources(ctx context.Context, pod *v1.Pod) error
+
+	// SetPodWatchCondition flags a pod to be inspected until the condition is met.
+	SetPodWatchCondition(types.UID, string, func(*PodStatus) bool)
 }
 
 // ShouldContainerBeRestarted checks whether a container needs to be restarted.
@@ -100,11 +113,20 @@ func ShouldContainerBeRestarted(container *v1.Container, pod *v1.Pod, podStatus 
 // Note: remember to update hashValues in container_hash_test.go as well.
 func HashContainer(container *v1.Container) uint64 {
 	hash := fnv.New32a()
-	// Omit nil or empty field when calculating hash value
-	// Please see https://github.com/kubernetes/kubernetes/issues/53644
-	containerJSON, _ := json.Marshal(container)
+	containerJSON, _ := json.Marshal(pickFieldsToHash(container))
 	hashutil.DeepHashObject(hash, containerJSON)
 	return uint64(hash.Sum32())
+}
+
+// pickFieldsToHash pick fields that will affect the running status of the container for hash,
+// currently this field range only contains `image` and `name`.
+// Note: this list must be updated if ever kubelet wants to allow mutations to other fields.
+func pickFieldsToHash(container *v1.Container) map[string]string {
+	retval := map[string]string{
+		"name":  container.Name,
+		"image": container.Image,
+	}
+	return retval
 }
 
 // envVarsToMap constructs a map of environment name to value from a slice
@@ -145,7 +167,7 @@ func ExpandContainerCommandOnlyStatic(containerCommand []string, envs []v1.EnvVa
 func ExpandContainerVolumeMounts(mount v1.VolumeMount, envs []EnvVar) (string, error) {
 
 	envmap := envVarsToMap(envs)
-	missingKeys := sets.NewString()
+	missingKeys := sets.New[string]()
 	expanded := expansion.Expand(mount.SubPathExpr, func(key string) string {
 		value, ok := envmap[key]
 		if !ok || len(value) == 0 {
@@ -155,7 +177,7 @@ func ExpandContainerVolumeMounts(mount v1.VolumeMount, envs []EnvVar) (string, e
 	})
 
 	if len(missingKeys) > 0 {
-		return "", fmt.Errorf("missing value for %s", strings.Join(missingKeys.List(), ", "))
+		return "", fmt.Errorf("missing value for %s", strings.Join(sets.List(missingKeys), ", "))
 	}
 	return expanded, nil
 }
@@ -242,12 +264,14 @@ func ConvertPodStatusToRunningPod(runtimeName string, podStatus *PodStatus) Pod 
 			continue
 		}
 		container := &Container{
-			ID:      containerStatus.ID,
-			Name:    containerStatus.Name,
-			Image:   containerStatus.Image,
-			ImageID: containerStatus.ImageID,
-			Hash:    containerStatus.Hash,
-			State:   containerStatus.State,
+			ID:                  containerStatus.ID,
+			Name:                containerStatus.Name,
+			Image:               containerStatus.Image,
+			ImageID:             containerStatus.ImageID,
+			ImageRef:            containerStatus.ImageRef,
+			ImageRuntimeHandler: containerStatus.ImageRuntimeHandler,
+			Hash:                containerStatus.Hash,
+			State:               containerStatus.State,
 		}
 		runningPod.Containers = append(runningPod.Containers, container)
 	}
@@ -368,4 +392,28 @@ func MakePortMappings(container *v1.Container) (ports []PortMapping) {
 		names[name] = struct{}{}
 	}
 	return
+}
+
+// HasAnyRegularContainerStarted returns true if any regular container has
+// started, which indicates all init containers have been initialized.
+func HasAnyRegularContainerStarted(spec *v1.PodSpec, statuses []v1.ContainerStatus) bool {
+	if len(statuses) == 0 {
+		return false
+	}
+
+	containerNames := make(map[string]struct{})
+	for _, c := range spec.Containers {
+		containerNames[c.Name] = struct{}{}
+	}
+
+	for _, status := range statuses {
+		if _, ok := containerNames[status.Name]; !ok {
+			continue
+		}
+		if status.State.Running != nil || status.State.Terminated != nil {
+			return true
+		}
+	}
+
+	return false
 }

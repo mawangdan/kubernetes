@@ -18,13 +18,13 @@ package etcd
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	clientv3 "go.etcd.io/etcd/client/v3"
 
 	v1 "k8s.io/api/core/v1"
@@ -32,11 +32,20 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/diff"
+	"k8s.io/apimachinery/pkg/runtime/serializer/cbor"
+	"k8s.io/apimachinery/pkg/runtime/serializer/json"
+	"k8s.io/apimachinery/pkg/runtime/serializer/recognizer"
+	utiljson "k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/version"
+	"k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/dynamic"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	componentbaseversion "k8s.io/component-base/version"
 	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
+	"k8s.io/kubernetes/pkg/features"
 )
 
 // Only add kinds to this list when this a virtual resource with get and create verbs that doesn't actually
@@ -70,8 +79,39 @@ var allowMissingTestdataFixtures = map[schema.GroupVersionKind]bool{
 // It will also fail when a type gets moved to a different location. Be very careful in this situation because
 // it essentially means that you will be break old clusters unless you create some migration path for the old data.
 func TestEtcdStoragePath(t *testing.T) {
+	supportedVersions := GetSupportedEmulatedVersions()
+	for _, v := range supportedVersions {
+		t.Run(v, func(t *testing.T) {
+			testEtcdStoragePathWithVersion(t, v)
+		})
+	}
+}
+
+func testEtcdStoragePathWithVersion(t *testing.T, v string) {
+	if v == componentbaseversion.DefaultKubeBinaryVersion {
+		featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, "AllAlpha", true)
+		featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, "AllBeta", true)
+	} else {
+		// Only test for beta and GA APIs with emulated version.
+		featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, feature.DefaultFeatureGate, version.MustParse(v))
+		featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, "AllBeta", true)
+		// Feature Gates that are GA and depend directly on the API version to work can not be emulated in previous versions.
+		// Example feature:
+		// v1.x-2 : FeatureGate alpha , API v1alpha1/feature
+		// v1.x-1 : FeatureGate beta  , API v1beta1/feature
+		// v1.x   : FeatureGate GA    , API v1/feature
+		// The code in v1.x uses the clients with the v1 API, if we emulate v1.x-1 it will not work against apiserver that
+		// only understand v1beta1.
+		featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, features.MultiCIDRServiceAllocator, false)
+	}
+
 	apiServer := StartRealAPIServerOrDie(t, func(opts *options.ServerRunOptions) {
+		// Disable alphas when emulating previous versions.
+		if v != componentbaseversion.DefaultKubeBinaryVersion {
+			opts.Options.APIEnablement.RuntimeConfig["api/alpha"] = "false"
+		}
 	})
+
 	defer apiServer.Cleanup()
 	defer dumpEtcdKVOnFailure(t, apiServer.KV)
 
@@ -81,7 +121,14 @@ func TestEtcdStoragePath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	etcdStorageData := GetEtcdStorageData()
+	var etcdStorageData map[schema.GroupVersionResource]StorageData
+	if v == componentbaseversion.DefaultKubeBinaryVersion {
+		etcdStorageData = GetEtcdStorageDataForNamespaceServedAt("etcdstoragepathtestnamespace", v, false)
+	} else {
+		// Drop alphas from etcd data fixtures when emulating previous versions
+		// as alphas are not supported with emulation.
+		etcdStorageData = GetEtcdStorageDataForNamespaceServedAt("etcdstoragepathtestnamespace", v, true)
+	}
 
 	kindSeen := sets.NewString()
 	pathSeen := map[string][]schema.GroupVersionResource{}
@@ -118,7 +165,8 @@ func TestEtcdStoragePath(t *testing.T) {
 				err   error
 			)
 			if shouldCreate {
-				if input, err = jsonToMetaObject([]byte(testData.Stub)); err != nil || input.isEmpty() {
+				input = new(metaObject)
+				if err = utiljson.Unmarshal([]byte(testData.Stub), input); err != nil || input.isEmpty() {
 					t.Fatalf("invalid test data for %s: %v", gvResource, err)
 				}
 				// unset type meta fields - we only set these in the CRD test data and it makes
@@ -146,7 +194,20 @@ func TestEtcdStoragePath(t *testing.T) {
 				}
 			}
 
-			output, err := getFromEtcd(apiServer.KV, testData.ExpectedEtcdPath)
+			// Build a decoder that can decode JSON and CBOR from storage.
+			scheme := runtime.NewScheme()
+			if testData.ExpectedGVK != nil {
+				scheme.AddKnownTypeWithName(*testData.ExpectedGVK, &metaObject{})
+			} else {
+				scheme.AddKnownTypeWithName(gvk, &metaObject{})
+
+			}
+			decoder := recognizer.NewDecoder(
+				cbor.NewSerializer(scheme, scheme),
+				json.NewSerializerWithOptions(json.DefaultMetaFactory, scheme, scheme, json.SerializerOptions{}),
+			)
+
+			output, err := getFromEtcd(decoder, apiServer.KV, testData.ExpectedEtcdPath)
 			if err != nil {
 				t.Fatalf("failed to get from etcd for %s: %#v", gvResource, err)
 			}
@@ -165,41 +226,50 @@ func TestEtcdStoragePath(t *testing.T) {
 				fixtureFilenameGroup = "core"
 			}
 			// find all versions of this group/kind in all versions of the serialization fixture testdata
-			previousReleaseGroupKindFiles, err := filepath.Glob("../../../staging/src/k8s.io/api/testdata/*/" + fixtureFilenameGroup + ".*." + expectedGVK.Kind + ".yaml")
+			releaseGroupKindFiles, err := filepath.Glob("../../../staging/src/k8s.io/api/testdata/*/" + fixtureFilenameGroup + ".*." + expectedGVK.Kind + ".yaml")
 			if err != nil {
 				t.Error(err)
 			}
-			if len(previousReleaseGroupKindFiles) == 0 && !allowMissingTestdataFixtures[expectedGVK] {
+			if len(releaseGroupKindFiles) == 0 && !allowMissingTestdataFixtures[expectedGVK] {
 				// We should at least find the HEAD fixtures
 				t.Errorf("No testdata serialization files found for %#v, cannot determine if previous releases could read this group/kind. Add this group-version to k8s.io/api/roundtrip_test.go", expectedGVK)
 			}
-			// find non-alpha versions of this group/kind understood by previous releases
+
+			// find non-alpha versions of this group/kind understood by current and previous releases
+			currentNonAlphaVersions := sets.NewString()
 			previousNonAlphaVersions := sets.NewString()
-			for _, previousReleaseGroupKindFile := range previousReleaseGroupKindFiles {
-				if serverVersion := filepath.Base(filepath.Dir(previousReleaseGroupKindFile)); serverVersion == "HEAD" {
-					continue
-				}
+			for _, previousReleaseGroupKindFile := range releaseGroupKindFiles {
 				parts := strings.Split(filepath.Base(previousReleaseGroupKindFile), ".")
 				version := parts[len(parts)-3]
 				if !strings.Contains(version, "alpha") {
-					previousNonAlphaVersions.Insert(version)
+					if serverVersion := filepath.Base(filepath.Dir(previousReleaseGroupKindFile)); serverVersion == "HEAD" {
+						currentNonAlphaVersions.Insert(version)
+					} else {
+						previousNonAlphaVersions.Insert(version)
+					}
 				}
 			}
-			if len(previousNonAlphaVersions) > 0 && !previousNonAlphaVersions.Has(expectedGVK.Version) {
-				t.Errorf("Previous releases understand non-alpha versions %q, but do not understand the expected current storage version %q. "+
+			if len(currentNonAlphaVersions) > 0 && strings.Contains(expectedGVK.Version, "alpha") {
+				t.Errorf("Non-alpha versions %q exist, but the expected storage version is %q. Prefer beta or GA storage versions over alpha.",
+					currentNonAlphaVersions.List(),
+					expectedGVK.Version,
+				)
+			}
+			if !strings.Contains(expectedGVK.Version, "alpha") && len(previousNonAlphaVersions) > 0 && !previousNonAlphaVersions.Has(expectedGVK.Version) {
+				t.Errorf("Previous releases understand non-alpha versions %q, but do not understand the expected current non-alpha storage version %q. "+
 					"This means a current server will store data in etcd that is not understood by a previous version.",
 					previousNonAlphaVersions.List(),
 					expectedGVK.Version,
 				)
 			}
 
-			actualGVK := output.getGVK()
+			actualGVK := output.GroupVersionKind()
 			if actualGVK != expectedGVK {
 				t.Errorf("GVK for %s does not match, expected %s got %s", kind, expectedGVK, actualGVK)
 			}
 
 			if !apiequality.Semantic.DeepDerivative(input, output) {
-				t.Errorf("Test stub for %s does not match: %s", kind, diff.ObjectGoPrintDiff(input, output))
+				t.Errorf("Test stub for %s does not match: %s", kind, cmp.Diff(input, output))
 			}
 
 			addGVKToEtcdBucket(cohabitatingResources, actualGVK, getEtcdBucket(testData.ExpectedEtcdPath))
@@ -274,9 +344,7 @@ func getEtcdBucket(path string) string {
 
 // stable fields to compare as a sanity check
 type metaObject struct {
-	// all of type meta
-	Kind       string `json:"kind,omitempty"`
-	APIVersion string `json:"apiVersion,omitempty"`
+	metav1.TypeMeta `json:",inline"`
 
 	// parts of object meta
 	Metadata struct {
@@ -285,8 +353,10 @@ type metaObject struct {
 	} `json:"metadata,omitempty"`
 }
 
-func (obj *metaObject) getGVK() schema.GroupVersionKind {
-	return schema.FromAPIVersionAndKind(obj.APIVersion, obj.Kind)
+var _ runtime.Object = &metaObject{}
+
+func (*metaObject) DeepCopyObject() runtime.Object {
+	panic("unimplemented")
 }
 
 func (obj *metaObject) isEmpty() bool {
@@ -298,14 +368,6 @@ type empty struct{}
 type cleanupData struct {
 	obj      *unstructured.Unstructured
 	resource schema.GroupVersionResource
-}
-
-func jsonToMetaObject(stub []byte) (*metaObject, error) {
-	obj := &metaObject{}
-	if err := json.Unmarshal(stub, obj); err != nil {
-		return nil, err
-	}
-	return obj, nil
 }
 
 func keyStringer(i interface{}) string {
@@ -371,7 +433,7 @@ func (c *allClient) createPrerequisites(mapper meta.RESTMapper, ns string, prere
 	return nil
 }
 
-func getFromEtcd(keys clientv3.KV, path string) (*metaObject, error) {
+func getFromEtcd(decoder runtime.Decoder, keys clientv3.KV, path string) (*metaObject, error) {
 	response, err := keys.Get(context.Background(), path)
 	if err != nil {
 		return nil, err
@@ -379,7 +441,11 @@ func getFromEtcd(keys clientv3.KV, path string) (*metaObject, error) {
 	if response.More || response.Count != 1 || len(response.Kvs) != 1 {
 		return nil, fmt.Errorf("Invalid etcd response (not found == %v): %#v", response.Count == 0, response)
 	}
-	return jsonToMetaObject(response.Kvs[0].Value)
+	var obj metaObject
+	if err := runtime.DecodeInto(decoder, response.Kvs[0].Value, &obj); err != nil {
+		return nil, err
+	}
+	return &obj, nil
 }
 
 func diffMaps(a, b interface{}) ([]string, []string) {

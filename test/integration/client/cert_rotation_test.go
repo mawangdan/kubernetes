@@ -23,6 +23,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math"
 	"math/big"
 	"os"
@@ -45,6 +46,7 @@ func TestCertRotation(t *testing.T) {
 	defer close(stopCh)
 
 	transport.CertCallbackRefreshDuration = 1 * time.Second
+	transport.DialerStopCh = stopCh
 
 	certDir := os.TempDir()
 	clientCAFilename, clientSigningCert, clientSigningKey := writeCACertFiles(t, certDir)
@@ -82,7 +84,7 @@ func TestCertRotation(t *testing.T) {
 	// Should have had a rotation; connections will have been closed
 	select {
 	case _, ok := <-w.ResultChan():
-		assert.Equal(t, false, ok)
+		assert.False(t, ok)
 	default:
 		t.Fatal("Watch wasn't closed despite rotation")
 	}
@@ -102,6 +104,7 @@ func TestCertRotationContinuousRequests(t *testing.T) {
 	defer close(stopCh)
 
 	transport.CertCallbackRefreshDuration = 1 * time.Second
+	transport.DialerStopCh = stopCh
 
 	certDir := os.TempDir()
 	clientCAFilename, clientSigningCert, clientSigningKey := writeCACertFiles(t, certDir)
@@ -135,7 +138,9 @@ func TestCertRotationContinuousRequests(t *testing.T) {
 	for range time.Tick(time.Second) {
 		_, err := client.CoreV1().ServiceAccounts("default").List(ctx, v1.ListOptions{})
 		if err != nil {
-			if err == ctx.Err() {
+			// client may wrap the context.Canceled error, so we can't
+			// do 'err == ctx.Err()', instead use 'errors.Is'.
+			if errors.Is(err, context.Canceled) {
 				return
 			}
 
@@ -178,10 +183,12 @@ func writeCerts(t *testing.T, clientSigningCert *x509.Certificate, clientSigning
 		t.Fatal(err)
 	}
 
-	serial, err := rand.Int(rand.Reader, new(big.Int).SetInt64(math.MaxInt64))
+	// returns a uniform random value in [0, max-1), then add 1 to serial to make it a uniform random value in [1, max).
+	serial, err := rand.Int(rand.Reader, new(big.Int).SetInt64(math.MaxInt64-1))
 	if err != nil {
 		t.Fatal(err)
 	}
+	serial = new(big.Int).Add(serial, big.NewInt(1))
 
 	certTmpl := x509.Certificate{
 		Subject: pkix.Name{

@@ -31,7 +31,6 @@
     "finalizers": [
       "finalizersValue"
     ],
-    "clusterName": "clusterNameValue",
     "managedFields": [
       {
         "manager": "managerValue",
@@ -92,7 +91,6 @@
         "finalizers": [
           "finalizersValue"
         ],
-        "clusterName": "clusterNameValue",
         "managedFields": [
           {
             "manager": "managerValue",
@@ -344,6 +342,26 @@
                     "audience": "audienceValue",
                     "expirationSeconds": 2,
                     "path": "pathValue"
+                  },
+                  "clusterTrustBundle": {
+                    "name": "nameValue",
+                    "signerName": "signerNameValue",
+                    "labelSelector": {
+                      "matchLabels": {
+                        "matchLabelsKey": "matchLabelsValue"
+                      },
+                      "matchExpressions": [
+                        {
+                          "key": "keyValue",
+                          "operator": "operatorValue",
+                          "values": [
+                            "valuesValue"
+                          ]
+                        }
+                      ]
+                    },
+                    "optional": true,
+                    "path": "pathValue"
                   }
                 }
               ],
@@ -420,7 +438,6 @@
                   "finalizers": [
                     "finalizersValue"
                   ],
-                  "clusterName": "clusterNameValue",
                   "managedFields": [
                     {
                       "manager": "managerValue",
@@ -470,10 +487,16 @@
                   "dataSourceRef": {
                     "apiGroup": "apiGroupValue",
                     "kind": "kindValue",
-                    "name": "nameValue"
-                  }
+                    "name": "nameValue",
+                    "namespace": "namespaceValue"
+                  },
+                  "volumeAttributesClassName": "volumeAttributesClassNameValue"
                 }
               }
+            },
+            "image": {
+              "reference": "referenceValue",
+              "pullPolicy": "pullPolicyValue"
             }
           }
         ],
@@ -543,12 +566,26 @@
               },
               "requests": {
                 "requestsKey": "0"
-              }
+              },
+              "claims": [
+                {
+                  "name": "nameValue",
+                  "request": "requestValue"
+                }
+              ]
             },
+            "resizePolicy": [
+              {
+                "resourceName": "resourceNameValue",
+                "restartPolicy": "restartPolicyValue"
+              }
+            ],
+            "restartPolicy": "restartPolicyValue",
             "volumeMounts": [
               {
                 "name": "nameValue",
                 "readOnly": true,
+                "recursiveReadOnly": "recursiveReadOnlyValue",
                 "mountPath": "mountPathValue",
                 "subPath": "subPathValue",
                 "mountPropagation": "mountPropagationValue",
@@ -682,6 +719,9 @@
                 "tcpSocket": {
                   "port": "portValue",
                   "host": "hostValue"
+                },
+                "sleep": {
+                  "seconds": 1
                 }
               },
               "preStop": {
@@ -705,6 +745,9 @@
                 "tcpSocket": {
                   "port": "portValue",
                   "host": "hostValue"
+                },
+                "sleep": {
+                  "seconds": 1
                 }
               }
             },
@@ -740,6 +783,10 @@
               "allowPrivilegeEscalation": true,
               "procMount": "procMountValue",
               "seccompProfile": {
+                "type": "typeValue",
+                "localhostProfile": "localhostProfileValue"
+              },
+              "appArmorProfile": {
                 "type": "typeValue",
                 "localhostProfile": "localhostProfileValue"
               }
@@ -815,12 +862,26 @@
               },
               "requests": {
                 "requestsKey": "0"
-              }
+              },
+              "claims": [
+                {
+                  "name": "nameValue",
+                  "request": "requestValue"
+                }
+              ]
             },
+            "resizePolicy": [
+              {
+                "resourceName": "resourceNameValue",
+                "restartPolicy": "restartPolicyValue"
+              }
+            ],
+            "restartPolicy": "restartPolicyValue",
             "volumeMounts": [
               {
                 "name": "nameValue",
                 "readOnly": true,
+                "recursiveReadOnly": "recursiveReadOnlyValue",
                 "mountPath": "mountPathValue",
                 "subPath": "subPathValue",
                 "mountPropagation": "mountPropagationValue",
@@ -954,6 +1015,9 @@
                 "tcpSocket": {
                   "port": "portValue",
                   "host": "hostValue"
+                },
+                "sleep": {
+                  "seconds": 1
                 }
               },
               "preStop": {
@@ -977,6 +1041,9 @@
                 "tcpSocket": {
                   "port": "portValue",
                   "host": "hostValue"
+                },
+                "sleep": {
+                  "seconds": 1
                 }
               }
             },
@@ -1012,6 +1079,10 @@
               "allowPrivilegeEscalation": true,
               "procMount": "procMountValue",
               "seccompProfile": {
+                "type": "typeValue",
+                "localhostProfile": "localhostProfileValue"
+              },
+              "appArmorProfile": {
                 "type": "typeValue",
                 "localhostProfile": "localhostProfileValue"
               }
@@ -1087,12 +1158,26 @@
               },
               "requests": {
                 "requestsKey": "0"
-              }
+              },
+              "claims": [
+                {
+                  "name": "nameValue",
+                  "request": "requestValue"
+                }
+              ]
             },
+            "resizePolicy": [
+              {
+                "resourceName": "resourceNameValue",
+                "restartPolicy": "restartPolicyValue"
+              }
+            ],
+            "restartPolicy": "restartPolicyValue",
             "volumeMounts": [
               {
                 "name": "nameValue",
                 "readOnly": true,
+                "recursiveReadOnly": "recursiveReadOnlyValue",
                 "mountPath": "mountPathValue",
                 "subPath": "subPathValue",
                 "mountPropagation": "mountPropagationValue",
@@ -1226,6 +1311,9 @@
                 "tcpSocket": {
                   "port": "portValue",
                   "host": "hostValue"
+                },
+                "sleep": {
+                  "seconds": 1
                 }
               },
               "preStop": {
@@ -1249,6 +1337,9 @@
                 "tcpSocket": {
                   "port": "portValue",
                   "host": "hostValue"
+                },
+                "sleep": {
+                  "seconds": 1
                 }
               }
             },
@@ -1284,6 +1375,10 @@
               "allowPrivilegeEscalation": true,
               "procMount": "procMountValue",
               "seccompProfile": {
+                "type": "typeValue",
+                "localhostProfile": "localhostProfileValue"
+              },
+              "appArmorProfile": {
                 "type": "typeValue",
                 "localhostProfile": "localhostProfileValue"
               }
@@ -1328,6 +1423,7 @@
           "supplementalGroups": [
             4
           ],
+          "supplementalGroupsPolicy": "supplementalGroupsPolicyValue",
           "fsGroup": 5,
           "sysctls": [
             {
@@ -1339,7 +1435,12 @@
           "seccompProfile": {
             "type": "typeValue",
             "localhostProfile": "localhostProfileValue"
-          }
+          },
+          "appArmorProfile": {
+            "type": "typeValue",
+            "localhostProfile": "localhostProfileValue"
+          },
+          "seLinuxChangePolicy": "seLinuxChangePolicyValue"
         },
         "imagePullSecrets": [
           {
@@ -1434,7 +1535,13 @@
                       ]
                     }
                   ]
-                }
+                },
+                "matchLabelKeys": [
+                  "matchLabelKeysValue"
+                ],
+                "mismatchLabelKeys": [
+                  "mismatchLabelKeysValue"
+                ]
               }
             ],
             "preferredDuringSchedulingIgnoredDuringExecution": [
@@ -1472,7 +1579,13 @@
                         ]
                       }
                     ]
-                  }
+                  },
+                  "matchLabelKeys": [
+                    "matchLabelKeysValue"
+                  ],
+                  "mismatchLabelKeys": [
+                    "mismatchLabelKeysValue"
+                  ]
                 }
               }
             ]
@@ -1511,7 +1624,13 @@
                       ]
                     }
                   ]
-                }
+                },
+                "matchLabelKeys": [
+                  "matchLabelKeysValue"
+                ],
+                "mismatchLabelKeys": [
+                  "mismatchLabelKeysValue"
+                ]
               }
             ],
             "preferredDuringSchedulingIgnoredDuringExecution": [
@@ -1549,7 +1668,13 @@
                         ]
                       }
                     ]
-                  }
+                  },
+                  "matchLabelKeys": [
+                    "matchLabelKeysValue"
+                  ],
+                  "mismatchLabelKeys": [
+                    "mismatchLabelKeysValue"
+                  ]
                 }
               }
             ]
@@ -1618,12 +1743,45 @@
                   ]
                 }
               ]
-            }
+            },
+            "minDomains": 5,
+            "nodeAffinityPolicy": "nodeAffinityPolicyValue",
+            "nodeTaintsPolicy": "nodeTaintsPolicyValue",
+            "matchLabelKeys": [
+              "matchLabelKeysValue"
+            ]
           }
         ],
         "setHostnameAsFQDN": true,
         "os": {
           "name": "nameValue"
+        },
+        "hostUsers": true,
+        "schedulingGates": [
+          {
+            "name": "nameValue"
+          }
+        ],
+        "resourceClaims": [
+          {
+            "name": "nameValue",
+            "resourceClaimName": "resourceClaimNameValue",
+            "resourceClaimTemplateName": "resourceClaimTemplateNameValue"
+          }
+        ],
+        "resources": {
+          "limits": {
+            "limitsKey": "0"
+          },
+          "requests": {
+            "requestsKey": "0"
+          },
+          "claims": [
+            {
+              "name": "nameValue",
+              "request": "requestValue"
+            }
+          ]
         }
       }
     }
@@ -1633,6 +1791,7 @@
     "fullyLabeledReplicas": 2,
     "readyReplicas": 4,
     "availableReplicas": 5,
+    "terminatingReplicas": 7,
     "observedGeneration": 3,
     "conditions": [
       {

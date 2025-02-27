@@ -23,14 +23,16 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/go-cmp/cmp"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/diff"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
@@ -43,8 +45,9 @@ import (
 	endptspkg "k8s.io/kubernetes/pkg/api/v1/endpoints"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	controllerpkg "k8s.io/kubernetes/pkg/controller"
+	"k8s.io/kubernetes/test/utils/ktesting"
 	utilnet "k8s.io/utils/net"
-	utilpointer "k8s.io/utils/pointer"
+	"k8s.io/utils/pointer"
 )
 
 var alwaysReady = func() bool { return true }
@@ -63,9 +66,10 @@ func testPod(namespace string, id int, nPorts int, isReady bool, ipFamilies []v1
 	p := &v1.Pod{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1"},
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: namespace,
-			Name:      fmt.Sprintf("pod%d", id),
-			Labels:    map[string]string{"foo": "bar"},
+			Namespace:       namespace,
+			Name:            fmt.Sprintf("pod%d", id),
+			Labels:          map[string]string{"foo": "bar"},
+			ResourceVersion: fmt.Sprint(id),
 		},
 		Spec: v1.PodSpec{
 			Containers: []v1.Container{{Ports: []v1.ContainerPort{}}},
@@ -89,9 +93,12 @@ func testPod(namespace string, id int, nPorts int, isReady bool, ipFamilies []v1
 	for _, family := range ipFamilies {
 		var ip string
 		if family == v1.IPv4Protocol {
-			ip = fmt.Sprintf("1.2.3.%d", 4+id)
+			// if id=1, ip=1.2.3.4
+			// if id=2, ip=1.2.3.5
+			// if id=999, ip=1.2.6.235
+			ip = fmt.Sprintf("1.2.%d.%d", 3+((4+id)/256), (4+id)%256)
 		} else {
-			ip = fmt.Sprintf("2000::%d", 4+id)
+			ip = fmt.Sprintf("2000::%x", 4+id)
 		}
 		p.Status.PodIPs = append(p.Status.PodIPs, v1.PodIP{IP: ip})
 	}
@@ -106,6 +113,13 @@ func addPods(store cache.Store, namespace string, nPods int, nPorts int, nNotRea
 		pod := testPod(namespace, i, nPorts, isReady, ipFamilies)
 		store.Add(pod)
 	}
+}
+
+func addBadIPPod(store cache.Store, namespace string, ipFamilies []v1.IPFamily) {
+	pod := testPod(namespace, 0, 1, true, ipFamilies)
+	pod.Status.PodIPs[0].IP = "0" + pod.Status.PodIPs[0].IP
+	pod.Status.PodIP = pod.Status.PodIPs[0].IP
+	store.Add(pod)
 }
 
 func addNotReadyPodsWithSpecifiedRestartPolicyAndPhase(store cache.Store, namespace string, nPods int, nPorts int, restartPolicy v1.RestartPolicy, podPhase v1.PodPhase) {
@@ -158,10 +172,10 @@ func makeTestServer(t *testing.T, namespace string) (*httptest.Server, *utiltest
 	return httptest.NewServer(mux), &fakeEndpointsHandler
 }
 
-// makeBlockingEndpointDeleteTestServer will signal the blockNextAction channel on endpoint "POST" & "DELETE" requests. All
-// block endpoint "DELETE" requestsi will wait on a blockDelete signal to delete endpoint. If controller is nil, a error will
-// be sent in the response.
-func makeBlockingEndpointDeleteTestServer(t *testing.T, controller *endpointController, endpoint *v1.Endpoints, blockDelete, blockNextAction chan struct{}, namespace string) *httptest.Server {
+// makeBlockingEndpointTestServer will signal the blockNextAction channel on endpoint "POST", "PUT", and "DELETE"
+// requests. "POST" and "PUT" requests will wait on a blockUpdate signal if provided, while "DELETE" requests will wait
+// on a blockDelete signal if provided. If controller is nil, an error will be sent in the response.
+func makeBlockingEndpointTestServer(t *testing.T, controller *endpointController, endpoint *v1.Endpoints, blockUpdate, blockDelete, blockNextAction chan struct{}, namespace string) *httptest.Server {
 
 	handlerFunc := func(res http.ResponseWriter, req *http.Request) {
 		if controller == nil {
@@ -170,23 +184,37 @@ func makeBlockingEndpointDeleteTestServer(t *testing.T, controller *endpointCont
 			return
 		}
 
-		if req.Method == "POST" {
-			controller.endpointsStore.Add(endpoint)
+		if req.Method == "POST" || req.Method == "PUT" {
+			if blockUpdate != nil {
+				go func() {
+					// Delay the update of endpoints to make endpoints cache out of sync
+					<-blockUpdate
+					_ = controller.endpointsStore.Add(endpoint)
+				}()
+			} else {
+				_ = controller.endpointsStore.Add(endpoint)
+			}
 			blockNextAction <- struct{}{}
 		}
 
 		if req.Method == "DELETE" {
-			go func() {
-				// Delay the deletion of endoints to make endpoint cache out of sync
-				<-blockDelete
-				controller.endpointsStore.Delete(endpoint)
+			if blockDelete != nil {
+				go func() {
+					// Delay the deletion of endpoints to make endpoints cache out of sync
+					<-blockDelete
+					_ = controller.endpointsStore.Delete(endpoint)
+					controller.onEndpointsDelete(endpoint)
+				}()
+			} else {
+				_ = controller.endpointsStore.Delete(endpoint)
 				controller.onEndpointsDelete(endpoint)
-			}()
+			}
 			blockNextAction <- struct{}{}
 		}
 
+		res.Header().Set("Content-Type", "application/json")
 		res.WriteHeader(http.StatusOK)
-		res.Write([]byte(runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{})))
+		_, _ = res.Write([]byte(runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), endpoint)))
 	}
 
 	mux := http.NewServeMux()
@@ -208,10 +236,10 @@ type endpointController struct {
 	endpointsStore cache.Store
 }
 
-func newController(url string, batchPeriod time.Duration) *endpointController {
-	client := clientset.NewForConfigOrDie(&restclient.Config{Host: url, ContentConfig: restclient.ContentConfig{GroupVersion: &schema.GroupVersion{Group: "", Version: "v1"}}})
+func newController(ctx context.Context, url string, batchPeriod time.Duration) *endpointController {
+	client := clientset.NewForConfigOrDie(&restclient.Config{Host: url, ContentConfig: restclient.ContentConfig{GroupVersion: &schema.GroupVersion{Group: "", Version: "v1"}, ContentType: runtime.ContentTypeJSON}})
 	informerFactory := informers.NewSharedInformerFactory(client, controllerpkg.NoResyncPeriodFunc())
-	endpoints := NewEndpointController(informerFactory.Core().V1().Pods(), informerFactory.Core().V1().Services(),
+	endpoints := NewEndpointController(ctx, informerFactory.Core().V1().Pods(), informerFactory.Core().V1().Services(),
 		informerFactory.Core().V1().Endpoints(), client, batchPeriod)
 	endpoints.podsSynced = alwaysReady
 	endpoints.servicesSynced = alwaysReady
@@ -224,11 +252,12 @@ func newController(url string, batchPeriod time.Duration) *endpointController {
 	}
 }
 
-func newFakeController(batchPeriod time.Duration) (*fake.Clientset, *endpointController) {
+func newFakeController(ctx context.Context, batchPeriod time.Duration) (*fake.Clientset, *endpointController) {
 	client := fake.NewSimpleClientset()
 	informerFactory := informers.NewSharedInformerFactory(client, controllerpkg.NoResyncPeriodFunc())
 
 	eController := NewEndpointController(
+		ctx,
 		informerFactory.Core().V1().Pods(),
 		informerFactory.Core().V1().Services(),
 		informerFactory.Core().V1().Endpoints(),
@@ -251,7 +280,9 @@ func TestSyncEndpointsItemsPreserveNoSelector(t *testing.T) {
 	ns := metav1.NamespaceDefault
 	testServer, endpointsHandler := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0*time.Second)
+
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 	endpoints.endpointsStore.Add(&v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
@@ -267,7 +298,10 @@ func TestSyncEndpointsItemsPreserveNoSelector(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
 		Spec:       v1.ServiceSpec{Ports: []v1.ServicePort{{Port: 80}}},
 	})
-	endpoints.syncService(context.TODO(), ns+"/foo")
+	err := endpoints.syncService(tCtx, ns+"/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
 	endpointsHandler.ValidateRequestCount(t, 0)
 }
 
@@ -275,7 +309,9 @@ func TestSyncEndpointsExistingNilSubsets(t *testing.T) {
 	ns := metav1.NamespaceDefault
 	testServer, endpointsHandler := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0*time.Second)
+
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 	endpoints.endpointsStore.Add(&v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
@@ -291,7 +327,10 @@ func TestSyncEndpointsExistingNilSubsets(t *testing.T) {
 			Ports:    []v1.ServicePort{{Port: 80}},
 		},
 	})
-	endpoints.syncService(context.TODO(), ns+"/foo")
+	err := endpoints.syncService(tCtx, ns+"/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
 	endpointsHandler.ValidateRequestCount(t, 0)
 }
 
@@ -299,7 +338,9 @@ func TestSyncEndpointsExistingEmptySubsets(t *testing.T) {
 	ns := metav1.NamespaceDefault
 	testServer, endpointsHandler := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0*time.Second)
+
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 	endpoints.endpointsStore.Add(&v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
@@ -315,7 +356,62 @@ func TestSyncEndpointsExistingEmptySubsets(t *testing.T) {
 			Ports:    []v1.ServicePort{{Port: 80}},
 		},
 	})
-	endpoints.syncService(context.TODO(), ns+"/foo")
+	err := endpoints.syncService(tCtx, ns+"/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
+	endpointsHandler.ValidateRequestCount(t, 0)
+}
+
+func TestSyncEndpointsWithPodResourceVersionUpdateOnly(t *testing.T) {
+	ns := metav1.NamespaceDefault
+	testServer, endpointsHandler := makeTestServer(t, ns)
+	defer testServer.Close()
+	pod0 := testPod(ns, 0, 1, true, ipv4only)
+	pod1 := testPod(ns, 1, 1, false, ipv4only)
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
+	endpoints.endpointsStore.Add(&v1.Endpoints{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "foo",
+			Namespace:       ns,
+			ResourceVersion: "1",
+		},
+		Subsets: []v1.EndpointSubset{{
+			Addresses: []v1.EndpointAddress{
+				{
+					IP:        pod0.Status.PodIPs[0].IP,
+					NodeName:  &emptyNodeName,
+					TargetRef: &v1.ObjectReference{Kind: "Pod", Name: pod0.Name, Namespace: ns, ResourceVersion: "1"},
+				},
+			},
+			NotReadyAddresses: []v1.EndpointAddress{
+				{
+					IP:        pod1.Status.PodIPs[0].IP,
+					NodeName:  &emptyNodeName,
+					TargetRef: &v1.ObjectReference{Kind: "Pod", Name: pod1.Name, Namespace: ns, ResourceVersion: "2"},
+				},
+			},
+			Ports: []v1.EndpointPort{{Port: 8080, Protocol: "TCP"}},
+		}},
+	})
+	endpoints.serviceStore.Add(&v1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
+		Spec: v1.ServiceSpec{
+			Selector:   map[string]string{"foo": "bar"},
+			Ports:      []v1.ServicePort{{Port: 80, Protocol: "TCP", TargetPort: intstr.FromInt32(8080)}},
+			IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
+		},
+	})
+	pod0.ResourceVersion = "3"
+	pod1.ResourceVersion = "4"
+	endpoints.podStore.Add(pod0)
+	endpoints.podStore.Add(pod1)
+	err := endpoints.syncService(tCtx, ns+"/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
+
 	endpointsHandler.ValidateRequestCount(t, 0)
 }
 
@@ -323,7 +419,8 @@ func TestSyncEndpointsNewNoSubsets(t *testing.T) {
 	ns := metav1.NamespaceDefault
 	testServer, endpointsHandler := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0*time.Second)
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 	endpoints.serviceStore.Add(&v1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
 		Spec: v1.ServiceSpec{
@@ -331,7 +428,10 @@ func TestSyncEndpointsNewNoSubsets(t *testing.T) {
 			Ports:    []v1.ServicePort{{Port: 80}},
 		},
 	})
-	endpoints.syncService(context.TODO(), ns+"/foo")
+	err := endpoints.syncService(tCtx, ns+"/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
 	endpointsHandler.ValidateRequestCount(t, 1)
 }
 
@@ -339,7 +439,9 @@ func TestCheckLeftoverEndpoints(t *testing.T) {
 	ns := metav1.NamespaceDefault
 	testServer, _ := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0*time.Second)
+
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 	endpoints.endpointsStore.Add(&v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
@@ -365,7 +467,8 @@ func TestSyncEndpointsProtocolTCP(t *testing.T) {
 	ns := "other"
 	testServer, endpointsHandler := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0*time.Second)
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 	endpoints.endpointsStore.Add(&v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
@@ -381,11 +484,15 @@ func TestSyncEndpointsProtocolTCP(t *testing.T) {
 	endpoints.serviceStore.Add(&v1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
 		Spec: v1.ServiceSpec{
-			Selector: map[string]string{},
-			Ports:    []v1.ServicePort{{Port: 80, TargetPort: intstr.FromInt(8080), Protocol: "TCP"}},
+			Selector:   map[string]string{},
+			Ports:      []v1.ServicePort{{Port: 80, TargetPort: intstr.FromInt32(8080), Protocol: "TCP"}},
+			IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 		},
 	})
-	endpoints.syncService(context.TODO(), ns+"/foo")
+	err := endpoints.syncService(tCtx, ns+"/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
 
 	endpointsHandler.ValidateRequestCount(t, 1)
 	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
@@ -409,7 +516,8 @@ func TestSyncEndpointsHeadlessServiceLabel(t *testing.T) {
 	ns := metav1.NamespaceDefault
 	testServer, endpointsHandler := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0*time.Second)
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 	endpoints.endpointsStore.Add(&v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
@@ -428,15 +536,90 @@ func TestSyncEndpointsHeadlessServiceLabel(t *testing.T) {
 			Ports:    []v1.ServicePort{{Port: 80}},
 		},
 	})
-	endpoints.syncService(context.TODO(), ns+"/foo")
+	err := endpoints.syncService(tCtx, ns+"/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
+
 	endpointsHandler.ValidateRequestCount(t, 0)
+}
+
+func TestSyncServiceExternalNameType(t *testing.T) {
+	serviceName := "testing-1"
+	namespace := metav1.NamespaceDefault
+
+	testCases := []struct {
+		desc    string
+		service *v1.Service
+	}{
+		{
+			desc: "External name with selector and ports should not receive endpoints",
+			service: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: namespace},
+				Spec: v1.ServiceSpec{
+					Selector: map[string]string{"foo": "bar"},
+					Ports:    []v1.ServicePort{{Port: 80}},
+					Type:     v1.ServiceTypeExternalName,
+				},
+			},
+		},
+		{
+			desc: "External name with ports should not receive endpoints",
+			service: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: namespace},
+				Spec: v1.ServiceSpec{
+					Ports: []v1.ServicePort{{Port: 80}},
+					Type:  v1.ServiceTypeExternalName,
+				},
+			},
+		},
+		{
+			desc: "External name with selector should not receive endpoints",
+			service: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: namespace},
+				Spec: v1.ServiceSpec{
+					Selector: map[string]string{"foo": "bar"},
+					Type:     v1.ServiceTypeExternalName,
+				},
+			},
+		},
+		{
+			desc: "External name without selector and ports should not receive endpoints",
+			service: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: namespace},
+				Spec: v1.ServiceSpec{
+					Type: v1.ServiceTypeExternalName,
+				},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			testServer, endpointsHandler := makeTestServer(t, namespace)
+
+			defer testServer.Close()
+			tCtx := ktesting.Init(t)
+			endpoints := newController(tCtx, testServer.URL, 0*time.Second)
+			err := endpoints.serviceStore.Add(tc.service)
+			if err != nil {
+				t.Fatalf("Error adding service to service store: %v", err)
+			}
+			err = endpoints.syncService(tCtx, namespace+"/"+serviceName)
+			if err != nil {
+				t.Fatalf("Error syncing service: %v", err)
+			}
+			endpointsHandler.ValidateRequestCount(t, 0)
+		})
+	}
 }
 
 func TestSyncEndpointsProtocolUDP(t *testing.T) {
 	ns := "other"
 	testServer, endpointsHandler := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0*time.Second)
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 	endpoints.endpointsStore.Add(&v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
@@ -452,11 +635,15 @@ func TestSyncEndpointsProtocolUDP(t *testing.T) {
 	endpoints.serviceStore.Add(&v1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
 		Spec: v1.ServiceSpec{
-			Selector: map[string]string{},
-			Ports:    []v1.ServicePort{{Port: 80, TargetPort: intstr.FromInt(8080), Protocol: "UDP"}},
+			Selector:   map[string]string{},
+			Ports:      []v1.ServicePort{{Port: 80, TargetPort: intstr.FromInt32(8080), Protocol: "UDP"}},
+			IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 		},
 	})
-	endpoints.syncService(context.TODO(), ns+"/foo")
+	err := endpoints.syncService(tCtx, ns+"/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
 
 	endpointsHandler.ValidateRequestCount(t, 1)
 	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
@@ -480,7 +667,8 @@ func TestSyncEndpointsProtocolSCTP(t *testing.T) {
 	ns := "other"
 	testServer, endpointsHandler := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0*time.Second)
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 	endpoints.endpointsStore.Add(&v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
@@ -496,11 +684,15 @@ func TestSyncEndpointsProtocolSCTP(t *testing.T) {
 	endpoints.serviceStore.Add(&v1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
 		Spec: v1.ServiceSpec{
-			Selector: map[string]string{},
-			Ports:    []v1.ServicePort{{Port: 80, TargetPort: intstr.FromInt(8080), Protocol: "SCTP"}},
+			Selector:   map[string]string{},
+			Ports:      []v1.ServicePort{{Port: 80, TargetPort: intstr.FromInt32(8080), Protocol: "SCTP"}},
+			IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 		},
 	})
-	endpoints.syncService(context.TODO(), ns+"/foo")
+	err := endpoints.syncService(tCtx, ns+"/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
 
 	endpointsHandler.ValidateRequestCount(t, 1)
 	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
@@ -524,7 +716,8 @@ func TestSyncEndpointsItemsEmptySelectorSelectsAll(t *testing.T) {
 	ns := "other"
 	testServer, endpointsHandler := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0*time.Second)
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 	endpoints.endpointsStore.Add(&v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
@@ -537,11 +730,15 @@ func TestSyncEndpointsItemsEmptySelectorSelectsAll(t *testing.T) {
 	endpoints.serviceStore.Add(&v1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
 		Spec: v1.ServiceSpec{
-			Selector: map[string]string{},
-			Ports:    []v1.ServicePort{{Port: 80, Protocol: "TCP", TargetPort: intstr.FromInt(8080)}},
+			Selector:   map[string]string{},
+			Ports:      []v1.ServicePort{{Port: 80, Protocol: "TCP", TargetPort: intstr.FromInt32(8080)}},
+			IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 		},
 	})
-	endpoints.syncService(context.TODO(), ns+"/foo")
+	err := endpoints.syncService(tCtx, ns+"/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
 
 	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
@@ -564,7 +761,9 @@ func TestSyncEndpointsItemsEmptySelectorSelectsAllNotReady(t *testing.T) {
 	ns := "other"
 	testServer, endpointsHandler := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0*time.Second)
+
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 	endpoints.endpointsStore.Add(&v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
@@ -577,11 +776,15 @@ func TestSyncEndpointsItemsEmptySelectorSelectsAllNotReady(t *testing.T) {
 	endpoints.serviceStore.Add(&v1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
 		Spec: v1.ServiceSpec{
-			Selector: map[string]string{},
-			Ports:    []v1.ServicePort{{Port: 80, Protocol: "TCP", TargetPort: intstr.FromInt(8080)}},
+			Selector:   map[string]string{},
+			Ports:      []v1.ServicePort{{Port: 80, Protocol: "TCP", TargetPort: intstr.FromInt32(8080)}},
+			IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 		},
 	})
-	endpoints.syncService(context.TODO(), ns+"/foo")
+	err := endpoints.syncService(tCtx, ns+"/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
 
 	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
@@ -604,7 +807,9 @@ func TestSyncEndpointsItemsEmptySelectorSelectsAllMixed(t *testing.T) {
 	ns := "other"
 	testServer, endpointsHandler := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0*time.Second)
+
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 	endpoints.endpointsStore.Add(&v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
@@ -617,11 +822,15 @@ func TestSyncEndpointsItemsEmptySelectorSelectsAllMixed(t *testing.T) {
 	endpoints.serviceStore.Add(&v1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
 		Spec: v1.ServiceSpec{
-			Selector: map[string]string{},
-			Ports:    []v1.ServicePort{{Port: 80, Protocol: "TCP", TargetPort: intstr.FromInt(8080)}},
+			Selector:   map[string]string{},
+			Ports:      []v1.ServicePort{{Port: 80, Protocol: "TCP", TargetPort: intstr.FromInt32(8080)}},
+			IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 		},
 	})
-	endpoints.syncService(context.TODO(), ns+"/foo")
+	err := endpoints.syncService(tCtx, ns+"/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
 
 	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
@@ -645,7 +854,8 @@ func TestSyncEndpointsItemsPreexisting(t *testing.T) {
 	ns := "bar"
 	testServer, endpointsHandler := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0*time.Second)
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 	endpoints.endpointsStore.Add(&v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
@@ -661,11 +871,15 @@ func TestSyncEndpointsItemsPreexisting(t *testing.T) {
 	endpoints.serviceStore.Add(&v1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
 		Spec: v1.ServiceSpec{
-			Selector: map[string]string{"foo": "bar"},
-			Ports:    []v1.ServicePort{{Port: 80, Protocol: "TCP", TargetPort: intstr.FromInt(8080)}},
+			Selector:   map[string]string{"foo": "bar"},
+			Ports:      []v1.ServicePort{{Port: 80, Protocol: "TCP", TargetPort: intstr.FromInt32(8080)}},
+			IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 		},
 	})
-	endpoints.syncService(context.TODO(), ns+"/foo")
+	err := endpoints.syncService(tCtx, ns+"/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
 
 	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
@@ -688,7 +902,8 @@ func TestSyncEndpointsItemsPreexistingIdentical(t *testing.T) {
 	ns := metav1.NamespaceDefault
 	testServer, endpointsHandler := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0*time.Second)
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 	endpoints.endpointsStore.Add(&v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			ResourceVersion: "1",
@@ -704,11 +919,15 @@ func TestSyncEndpointsItemsPreexistingIdentical(t *testing.T) {
 	endpoints.serviceStore.Add(&v1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: metav1.NamespaceDefault},
 		Spec: v1.ServiceSpec{
-			Selector: map[string]string{"foo": "bar"},
-			Ports:    []v1.ServicePort{{Port: 80, Protocol: "TCP", TargetPort: intstr.FromInt(8080)}},
+			Selector:   map[string]string{"foo": "bar"},
+			Ports:      []v1.ServicePort{{Port: 80, Protocol: "TCP", TargetPort: intstr.FromInt32(8080)}},
+			IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 		},
 	})
-	endpoints.syncService(context.TODO(), ns+"/foo")
+	err := endpoints.syncService(tCtx, ns+"/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
 	endpointsHandler.ValidateRequestCount(t, 0)
 }
 
@@ -716,7 +935,8 @@ func TestSyncEndpointsItems(t *testing.T) {
 	ns := "other"
 	testServer, endpointsHandler := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0*time.Second)
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 	addPods(endpoints.podStore, ns, 3, 2, 0, ipv4only)
 	addPods(endpoints.podStore, "blah", 5, 2, 0, ipv4only) // make sure these aren't found!
 
@@ -725,12 +945,16 @@ func TestSyncEndpointsItems(t *testing.T) {
 		Spec: v1.ServiceSpec{
 			Selector: map[string]string{"foo": "bar"},
 			Ports: []v1.ServicePort{
-				{Name: "port0", Port: 80, Protocol: "TCP", TargetPort: intstr.FromInt(8080)},
-				{Name: "port1", Port: 88, Protocol: "TCP", TargetPort: intstr.FromInt(8088)},
+				{Name: "port0", Port: 80, Protocol: "TCP", TargetPort: intstr.FromInt32(8080)},
+				{Name: "port1", Port: 88, Protocol: "TCP", TargetPort: intstr.FromInt32(8088)},
 			},
+			IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 		},
 	})
-	endpoints.syncService(context.TODO(), "other/foo")
+	err := endpoints.syncService(tCtx, "other/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
 
 	expectedSubsets := []v1.EndpointSubset{{
 		Addresses: []v1.EndpointAddress{
@@ -761,7 +985,8 @@ func TestSyncEndpointsItemsWithLabels(t *testing.T) {
 	ns := "other"
 	testServer, endpointsHandler := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0*time.Second)
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 	addPods(endpoints.podStore, ns, 3, 2, 0, ipv4only)
 	serviceLabels := map[string]string{"foo": "bar"}
 	endpoints.serviceStore.Add(&v1.Service{
@@ -773,12 +998,16 @@ func TestSyncEndpointsItemsWithLabels(t *testing.T) {
 		Spec: v1.ServiceSpec{
 			Selector: map[string]string{"foo": "bar"},
 			Ports: []v1.ServicePort{
-				{Name: "port0", Port: 80, Protocol: "TCP", TargetPort: intstr.FromInt(8080)},
-				{Name: "port1", Port: 88, Protocol: "TCP", TargetPort: intstr.FromInt(8088)},
+				{Name: "port0", Port: 80, Protocol: "TCP", TargetPort: intstr.FromInt32(8080)},
+				{Name: "port1", Port: 88, Protocol: "TCP", TargetPort: intstr.FromInt32(8088)},
 			},
+			IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 		},
 	})
-	endpoints.syncService(context.TODO(), ns+"/foo")
+	err := endpoints.syncService(tCtx, ns+"/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
 
 	expectedSubsets := []v1.EndpointSubset{{
 		Addresses: []v1.EndpointAddress{
@@ -809,7 +1038,8 @@ func TestSyncEndpointsItemsPreexistingLabelsChange(t *testing.T) {
 	ns := "bar"
 	testServer, endpointsHandler := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0*time.Second)
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 	endpoints.endpointsStore.Add(&v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
@@ -833,11 +1063,15 @@ func TestSyncEndpointsItemsPreexistingLabelsChange(t *testing.T) {
 			Labels:    serviceLabels,
 		},
 		Spec: v1.ServiceSpec{
-			Selector: map[string]string{"foo": "bar"},
-			Ports:    []v1.ServicePort{{Port: 80, Protocol: "TCP", TargetPort: intstr.FromInt(8080)}},
+			Selector:   map[string]string{"foo": "bar"},
+			Ports:      []v1.ServicePort{{Port: 80, Protocol: "TCP", TargetPort: intstr.FromInt32(8080)}},
+			IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 		},
 	})
-	endpoints.syncService(context.TODO(), ns+"/foo")
+	err := endpoints.syncService(tCtx, ns+"/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
 
 	serviceLabels[v1.IsHeadlessService] = ""
 	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
@@ -873,14 +1107,16 @@ func TestWaitsForAllInformersToBeSynced2(t *testing.T) {
 			ns := "other"
 			testServer, endpointsHandler := makeTestServer(t, ns)
 			defer testServer.Close()
-			endpoints := newController(testServer.URL, 0*time.Second)
+			tCtx := ktesting.Init(t)
+			endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 			addPods(endpoints.podStore, ns, 1, 1, 0, ipv4only)
 
 			service := &v1.Service{
 				ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
 				Spec: v1.ServiceSpec{
-					Selector: map[string]string{},
-					Ports:    []v1.ServicePort{{Port: 80, TargetPort: intstr.FromInt(8080), Protocol: "TCP"}},
+					Selector:   map[string]string{},
+					Ports:      []v1.ServicePort{{Port: 80, TargetPort: intstr.FromInt32(8080), Protocol: "TCP"}},
+					IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 				},
 			}
 			endpoints.serviceStore.Add(service)
@@ -889,9 +1125,7 @@ func TestWaitsForAllInformersToBeSynced2(t *testing.T) {
 			endpoints.servicesSynced = test.servicesSynced
 			endpoints.endpointsSynced = test.endpointsSynced
 			endpoints.workerLoopPeriod = 10 * time.Millisecond
-			stopCh := make(chan struct{})
-			defer close(stopCh)
-			go endpoints.Run(context.TODO(), 1)
+			go endpoints.Run(tCtx, 1)
 
 			// cache.WaitForNamedCacheSync has a 100ms poll period, and the endpoints worker has a 10ms period.
 			// To ensure we get all updates, including unexpected ones, we need to wait at least as long as
@@ -914,7 +1148,8 @@ func TestSyncEndpointsHeadlessService(t *testing.T) {
 	ns := "headless"
 	testServer, endpointsHandler := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0*time.Second)
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 	endpoints.endpointsStore.Add(&v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
@@ -930,14 +1165,18 @@ func TestSyncEndpointsHeadlessService(t *testing.T) {
 	service := &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns, Labels: map[string]string{"a": "b"}},
 		Spec: v1.ServiceSpec{
-			Selector:  map[string]string{},
-			ClusterIP: api.ClusterIPNone,
-			Ports:     []v1.ServicePort{},
+			Selector:   map[string]string{},
+			ClusterIP:  api.ClusterIPNone,
+			Ports:      []v1.ServicePort{},
+			IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 		},
 	}
 	originalService := service.DeepCopy()
 	endpoints.serviceStore.Add(service)
-	endpoints.syncService(context.TODO(), ns+"/foo")
+	err := endpoints.syncService(tCtx, ns+"/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
 	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
@@ -954,7 +1193,7 @@ func TestSyncEndpointsHeadlessService(t *testing.T) {
 		}},
 	})
 	if !reflect.DeepEqual(originalService, service) {
-		t.Fatalf("syncing endpoints changed service: %s", diff.ObjectReflectDiff(service, originalService))
+		t.Fatalf("syncing endpoints changed service: %s", cmp.Diff(service, originalService))
 	}
 	endpointsHandler.ValidateRequestCount(t, 1)
 	endpointsHandler.ValidateRequest(t, "/api/v1/namespaces/"+ns+"/endpoints/foo", "PUT", &data)
@@ -964,7 +1203,9 @@ func TestSyncEndpointsItemsExcludeNotReadyPodsWithRestartPolicyNeverAndPhaseFail
 	ns := "other"
 	testServer, endpointsHandler := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0*time.Second)
+
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 	endpoints.endpointsStore.Add(&v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
@@ -980,11 +1221,15 @@ func TestSyncEndpointsItemsExcludeNotReadyPodsWithRestartPolicyNeverAndPhaseFail
 	endpoints.serviceStore.Add(&v1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
 		Spec: v1.ServiceSpec{
-			Selector: map[string]string{"foo": "bar"},
-			Ports:    []v1.ServicePort{{Port: 80, Protocol: "TCP", TargetPort: intstr.FromInt(8080)}},
+			Selector:   map[string]string{"foo": "bar"},
+			Ports:      []v1.ServicePort{{Port: 80, Protocol: "TCP", TargetPort: intstr.FromInt32(8080)}},
+			IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 		},
 	})
-	endpoints.syncService(context.TODO(), ns+"/foo")
+	err := endpoints.syncService(tCtx, ns+"/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
 	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
@@ -1003,7 +1248,9 @@ func TestSyncEndpointsItemsExcludeNotReadyPodsWithRestartPolicyNeverAndPhaseSucc
 	ns := "other"
 	testServer, endpointsHandler := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0*time.Second)
+
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 	endpoints.endpointsStore.Add(&v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
@@ -1019,11 +1266,15 @@ func TestSyncEndpointsItemsExcludeNotReadyPodsWithRestartPolicyNeverAndPhaseSucc
 	endpoints.serviceStore.Add(&v1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
 		Spec: v1.ServiceSpec{
-			Selector: map[string]string{"foo": "bar"},
-			Ports:    []v1.ServicePort{{Port: 80, Protocol: "TCP", TargetPort: intstr.FromInt(8080)}},
+			Selector:   map[string]string{"foo": "bar"},
+			Ports:      []v1.ServicePort{{Port: 80, Protocol: "TCP", TargetPort: intstr.FromInt32(8080)}},
+			IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 		},
 	})
-	endpoints.syncService(context.TODO(), ns+"/foo")
+	err := endpoints.syncService(tCtx, ns+"/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
 	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
@@ -1042,7 +1293,9 @@ func TestSyncEndpointsItemsExcludeNotReadyPodsWithRestartPolicyOnFailureAndPhase
 	ns := "other"
 	testServer, endpointsHandler := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0*time.Second)
+
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 	endpoints.endpointsStore.Add(&v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
@@ -1058,11 +1311,16 @@ func TestSyncEndpointsItemsExcludeNotReadyPodsWithRestartPolicyOnFailureAndPhase
 	endpoints.serviceStore.Add(&v1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
 		Spec: v1.ServiceSpec{
-			Selector: map[string]string{"foo": "bar"},
-			Ports:    []v1.ServicePort{{Port: 80, Protocol: "TCP", TargetPort: intstr.FromInt(8080)}},
+			Selector:   map[string]string{"foo": "bar"},
+			Ports:      []v1.ServicePort{{Port: 80, Protocol: "TCP", TargetPort: intstr.FromInt32(8080)}},
+			IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 		},
 	})
-	endpoints.syncService(context.TODO(), ns+"/foo")
+	err := endpoints.syncService(tCtx, ns+"/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
+
 	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
@@ -1081,17 +1339,23 @@ func TestSyncEndpointsHeadlessWithoutPort(t *testing.T) {
 	ns := metav1.NamespaceDefault
 	testServer, endpointsHandler := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0*time.Second)
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 	endpoints.serviceStore.Add(&v1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
 		Spec: v1.ServiceSpec{
-			Selector:  map[string]string{"foo": "bar"},
-			ClusterIP: "None",
-			Ports:     nil,
+			Selector:   map[string]string{"foo": "bar"},
+			ClusterIP:  "None",
+			Ports:      nil,
+			IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 		},
 	})
 	addPods(endpoints.podStore, ns, 1, 1, 0, ipv4only)
-	endpoints.syncService(context.TODO(), ns+"/foo")
+
+	err := endpoints.syncService(tCtx, ns+"/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
 	endpointsHandler.ValidateRequestCount(t, 1)
 	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1106,97 +1370,6 @@ func TestSyncEndpointsHeadlessWithoutPort(t *testing.T) {
 		}},
 	})
 	endpointsHandler.ValidateRequest(t, "/api/v1/namespaces/"+ns+"/endpoints", "POST", &data)
-}
-
-// There are 3*5 possibilities(3 types of RestartPolicy by 5 types of PodPhase). Not list them all here.
-// Just list all of the 3 false cases and 3 of the 12 true cases.
-func TestShouldPodBeInEndpoints(t *testing.T) {
-	testCases := []struct {
-		name     string
-		pod      *v1.Pod
-		expected bool
-	}{
-		// Pod should not be in endpoints cases:
-		{
-			name: "Failed pod with Never RestartPolicy",
-			pod: &v1.Pod{
-				Spec: v1.PodSpec{
-					RestartPolicy: v1.RestartPolicyNever,
-				},
-				Status: v1.PodStatus{
-					Phase: v1.PodFailed,
-				},
-			},
-			expected: false,
-		},
-		{
-			name: "Succeeded pod with Never RestartPolicy",
-			pod: &v1.Pod{
-				Spec: v1.PodSpec{
-					RestartPolicy: v1.RestartPolicyNever,
-				},
-				Status: v1.PodStatus{
-					Phase: v1.PodSucceeded,
-				},
-			},
-			expected: false,
-		},
-		{
-			name: "Succeeded pod with OnFailure RestartPolicy",
-			pod: &v1.Pod{
-				Spec: v1.PodSpec{
-					RestartPolicy: v1.RestartPolicyOnFailure,
-				},
-				Status: v1.PodStatus{
-					Phase: v1.PodSucceeded,
-				},
-			},
-			expected: false,
-		},
-		// Pod should be in endpoints cases:
-		{
-			name: "Failed pod with Always RestartPolicy",
-			pod: &v1.Pod{
-				Spec: v1.PodSpec{
-					RestartPolicy: v1.RestartPolicyAlways,
-				},
-				Status: v1.PodStatus{
-					Phase: v1.PodFailed,
-				},
-			},
-			expected: true,
-		},
-		{
-			name: "Pending pod with Never RestartPolicy",
-			pod: &v1.Pod{
-				Spec: v1.PodSpec{
-					RestartPolicy: v1.RestartPolicyNever,
-				},
-				Status: v1.PodStatus{
-					Phase: v1.PodPending,
-				},
-			},
-			expected: true,
-		},
-		{
-			name: "Unknown pod with OnFailure RestartPolicy",
-			pod: &v1.Pod{
-				Spec: v1.PodSpec{
-					RestartPolicy: v1.RestartPolicyOnFailure,
-				},
-				Status: v1.PodStatus{
-					Phase: v1.PodUnknown,
-				},
-			},
-			expected: true,
-		},
-	}
-	for _, test := range testCases {
-		result := shouldPodBeInEndpoints(test.pod)
-		if result != test.expected {
-			t.Errorf("%s: expected : %t, got: %t", test.name, test.expected, result)
-		}
-	}
 }
 
 func TestPodToEndpointAddressForService(t *testing.T) {
@@ -1215,7 +1388,8 @@ func TestPodToEndpointAddressForService(t *testing.T) {
 			ipFamilies: ipv4only,
 			service: v1.Service{
 				Spec: v1.ServiceSpec{
-					ClusterIP: "10.0.0.1",
+					ClusterIP:  "10.0.0.1",
+					IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 				},
 			},
 			expectedEndpointFamily: ipv4,
@@ -1225,7 +1399,8 @@ func TestPodToEndpointAddressForService(t *testing.T) {
 			ipFamilies: ipv4ipv6,
 			service: v1.Service{
 				Spec: v1.ServiceSpec{
-					ClusterIP: "10.0.0.1",
+					ClusterIP:  "10.0.0.1",
+					IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 				},
 			},
 			expectedEndpointFamily: ipv4,
@@ -1235,7 +1410,8 @@ func TestPodToEndpointAddressForService(t *testing.T) {
 			ipFamilies: ipv6ipv4,
 			service: v1.Service{
 				Spec: v1.ServiceSpec{
-					ClusterIP: "10.0.0.1",
+					ClusterIP:  "10.0.0.1",
+					IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 				},
 			},
 			expectedEndpointFamily: ipv4,
@@ -1245,7 +1421,8 @@ func TestPodToEndpointAddressForService(t *testing.T) {
 			ipFamilies: ipv4only,
 			service: v1.Service{
 				Spec: v1.ServiceSpec{
-					ClusterIP: v1.ClusterIPNone,
+					ClusterIP:  v1.ClusterIPNone,
+					IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 				},
 			},
 			expectedEndpointFamily: ipv4,
@@ -1262,31 +1439,12 @@ func TestPodToEndpointAddressForService(t *testing.T) {
 			expectedEndpointFamily: ipv4,
 		},
 		{
-			name:       "v4 legacy headless service, in a dual stack cluster",
-			ipFamilies: ipv4ipv6,
-			service: v1.Service{
-				Spec: v1.ServiceSpec{
-					ClusterIP: v1.ClusterIPNone,
-				},
-			},
-			expectedEndpointFamily: ipv4,
-		},
-		{
-			name:       "v4 legacy headless service, in a dual stack ipv6-primary cluster",
-			ipFamilies: ipv6ipv4,
-			service: v1.Service{
-				Spec: v1.ServiceSpec{
-					ClusterIP: v1.ClusterIPNone,
-				},
-			},
-			expectedEndpointFamily: ipv6,
-		},
-		{
 			name:       "v6 service, in a dual stack cluster",
 			ipFamilies: ipv4ipv6,
 			service: v1.Service{
 				Spec: v1.ServiceSpec{
-					ClusterIP: "3000::1",
+					ClusterIP:  "3000::1",
+					IPFamilies: []v1.IPFamily{v1.IPv6Protocol},
 				},
 			},
 			expectedEndpointFamily: ipv6,
@@ -1296,13 +1454,14 @@ func TestPodToEndpointAddressForService(t *testing.T) {
 			ipFamilies: ipv6only,
 			service: v1.Service{
 				Spec: v1.ServiceSpec{
-					ClusterIP: v1.ClusterIPNone,
+					ClusterIP:  v1.ClusterIPNone,
+					IPFamilies: []v1.IPFamily{v1.IPv6Protocol},
 				},
 			},
 			expectedEndpointFamily: ipv6,
 		},
 		{
-			name:       "v6 headless service, in a dual stack cluster (connected to a new api-server)",
+			name:       "v6 headless service, in a dual stack cluster",
 			ipFamilies: ipv4ipv6,
 			service: v1.Service{
 				Spec: v1.ServiceSpec{
@@ -1313,38 +1472,12 @@ func TestPodToEndpointAddressForService(t *testing.T) {
 			expectedEndpointFamily: ipv6,
 		},
 		{
-			name:       "v6 legacy headless service, in a dual stack cluster  (connected to a old api-server)",
-			ipFamilies: ipv4ipv6,
-			service: v1.Service{
-				Spec: v1.ServiceSpec{
-					ClusterIP: v1.ClusterIPNone, // <- families are not set by api-server
-				},
-			},
-			expectedEndpointFamily: ipv4,
-		},
-		// in reality this is a misconfigured cluster
-		// i.e user is not using dual stack and have PodIP == v4 and ServiceIP==v6
-		// previously controller could assign wrong ip to endpoint address
-		// with gate removed. this is no longer the case. this is *not* behavior change
-		// because previously things would have failed in kube-proxy anyway (due to editing wrong iptables).
-		{
-			name:       "v6 service, in a v4 only cluster.",
-			ipFamilies: ipv4only,
-			service: v1.Service{
-				Spec: v1.ServiceSpec{
-					ClusterIP: "3000::1",
-				},
-			},
-			expectError:            true,
-			expectedEndpointFamily: ipv4,
-		},
-		// but this will actually give an error
-		{
 			name:       "v6 service, in a v4 only cluster",
 			ipFamilies: ipv4only,
 			service: v1.Service{
 				Spec: v1.ServiceSpec{
-					ClusterIP: "3000::1",
+					ClusterIP:  "3000::1",
+					IPFamilies: []v1.IPFamily{v1.IPv6Protocol},
 				},
 			},
 			expectError: true,
@@ -1354,7 +1487,9 @@ func TestPodToEndpointAddressForService(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			podStore := cache.NewStore(cache.DeletionHandlingMetaNamespaceKeyFunc)
 			ns := "test"
-			addPods(podStore, ns, 1, 1, 0, tc.ipFamilies)
+			// We use addBadIPPod to test that podToEndpointAddressForService
+			// fixes up the bad IP.
+			addBadIPPod(podStore, ns, tc.ipFamilies)
 			pods := podStore.List()
 			if len(pods) != 1 {
 				t.Fatalf("podStore size: expected: %d, got: %d", 1, len(pods))
@@ -1377,6 +1512,9 @@ func TestPodToEndpointAddressForService(t *testing.T) {
 			if utilnet.IsIPv6String(epa.IP) != (tc.expectedEndpointFamily == ipv6) {
 				t.Fatalf("IP: expected %s, got: %s", tc.expectedEndpointFamily, epa.IP)
 			}
+			if strings.HasPrefix(epa.IP, "0") {
+				t.Fatalf("IP: expected valid, got: %s", epa.IP)
+			}
 			if *(epa.NodeName) != pod.Spec.NodeName {
 				t.Fatalf("NodeName: expected: %s, got: %s", pod.Spec.NodeName, *(epa.NodeName))
 			}
@@ -1384,16 +1522,16 @@ func TestPodToEndpointAddressForService(t *testing.T) {
 				t.Fatalf("TargetRef.Kind: expected: %s, got: %s", "Pod", epa.TargetRef.Kind)
 			}
 			if epa.TargetRef.Namespace != pod.ObjectMeta.Namespace {
-				t.Fatalf("TargetRef.Kind: expected: %s, got: %s", pod.ObjectMeta.Namespace, epa.TargetRef.Namespace)
+				t.Fatalf("TargetRef.Namespace: expected: %s, got: %s", pod.ObjectMeta.Namespace, epa.TargetRef.Namespace)
 			}
 			if epa.TargetRef.Name != pod.ObjectMeta.Name {
-				t.Fatalf("TargetRef.Kind: expected: %s, got: %s", pod.ObjectMeta.Name, epa.TargetRef.Name)
+				t.Fatalf("TargetRef.Name: expected: %s, got: %s", pod.ObjectMeta.Name, epa.TargetRef.Name)
 			}
 			if epa.TargetRef.UID != pod.ObjectMeta.UID {
-				t.Fatalf("TargetRef.Kind: expected: %s, got: %s", pod.ObjectMeta.UID, epa.TargetRef.UID)
+				t.Fatalf("TargetRef.UID: expected: %s, got: %s", pod.ObjectMeta.UID, epa.TargetRef.UID)
 			}
-			if epa.TargetRef.ResourceVersion != pod.ObjectMeta.ResourceVersion {
-				t.Fatalf("TargetRef.Kind: expected: %s, got: %s", pod.ObjectMeta.ResourceVersion, epa.TargetRef.ResourceVersion)
+			if epa.TargetRef.ResourceVersion != "" {
+				t.Fatalf("TargetRef.ResourceVersion: expected empty, got: %s", epa.TargetRef.ResourceVersion)
 			}
 		})
 	}
@@ -1404,7 +1542,9 @@ func TestLastTriggerChangeTimeAnnotation(t *testing.T) {
 	ns := "other"
 	testServer, endpointsHandler := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0*time.Second)
+
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 	endpoints.endpointsStore.Add(&v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
@@ -1420,11 +1560,15 @@ func TestLastTriggerChangeTimeAnnotation(t *testing.T) {
 	endpoints.serviceStore.Add(&v1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns, CreationTimestamp: metav1.NewTime(triggerTime)},
 		Spec: v1.ServiceSpec{
-			Selector: map[string]string{},
-			Ports:    []v1.ServicePort{{Port: 80, TargetPort: intstr.FromInt(8080), Protocol: "TCP"}},
+			Selector:   map[string]string{},
+			Ports:      []v1.ServicePort{{Port: 80, TargetPort: intstr.FromInt32(8080), Protocol: "TCP"}},
+			IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 		},
 	})
-	endpoints.syncService(context.TODO(), ns+"/foo")
+	err := endpoints.syncService(tCtx, ns+"/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
 
 	endpointsHandler.ValidateRequestCount(t, 1)
 	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
@@ -1451,7 +1595,9 @@ func TestLastTriggerChangeTimeAnnotation_AnnotationOverridden(t *testing.T) {
 	ns := "other"
 	testServer, endpointsHandler := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0*time.Second)
+
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 	endpoints.endpointsStore.Add(&v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
@@ -1470,11 +1616,15 @@ func TestLastTriggerChangeTimeAnnotation_AnnotationOverridden(t *testing.T) {
 	endpoints.serviceStore.Add(&v1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns, CreationTimestamp: metav1.NewTime(triggerTime)},
 		Spec: v1.ServiceSpec{
-			Selector: map[string]string{},
-			Ports:    []v1.ServicePort{{Port: 80, TargetPort: intstr.FromInt(8080), Protocol: "TCP"}},
+			Selector:   map[string]string{},
+			Ports:      []v1.ServicePort{{Port: 80, TargetPort: intstr.FromInt32(8080), Protocol: "TCP"}},
+			IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 		},
 	})
-	endpoints.syncService(context.TODO(), ns+"/foo")
+	err := endpoints.syncService(tCtx, ns+"/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
 
 	endpointsHandler.ValidateRequestCount(t, 1)
 	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
@@ -1501,7 +1651,9 @@ func TestLastTriggerChangeTimeAnnotation_AnnotationCleared(t *testing.T) {
 	ns := "other"
 	testServer, endpointsHandler := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0*time.Second)
+
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0*time.Second)
 	endpoints.endpointsStore.Add(&v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
@@ -1521,11 +1673,15 @@ func TestLastTriggerChangeTimeAnnotation_AnnotationCleared(t *testing.T) {
 	endpoints.serviceStore.Add(&v1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
 		Spec: v1.ServiceSpec{
-			Selector: map[string]string{},
-			Ports:    []v1.ServicePort{{Port: 80, TargetPort: intstr.FromInt(8080), Protocol: "TCP"}},
+			Selector:   map[string]string{},
+			Ports:      []v1.ServicePort{{Port: 80, TargetPort: intstr.FromInt32(8080), Protocol: "TCP"}},
+			IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 		},
 	})
-	endpoints.syncService(context.TODO(), ns+"/foo")
+	err := endpoints.syncService(tCtx, ns+"/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
 
 	endpointsHandler.ValidateRequestCount(t, 1)
 	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
@@ -1646,23 +1802,24 @@ func TestPodUpdatesBatching(t *testing.T) {
 			resourceVersion := 1
 			testServer, endpointsHandler := makeTestServer(t, ns)
 			defer testServer.Close()
-			endpoints := newController(testServer.URL, tc.batchPeriod)
-			stopCh := make(chan struct{})
-			defer close(stopCh)
+
+			tCtx := ktesting.Init(t)
+			endpoints := newController(tCtx, testServer.URL, tc.batchPeriod)
 			endpoints.podsSynced = alwaysReady
 			endpoints.servicesSynced = alwaysReady
 			endpoints.endpointsSynced = alwaysReady
 			endpoints.workerLoopPeriod = 10 * time.Millisecond
 
-			go endpoints.Run(context.TODO(), 1)
+			go endpoints.Run(tCtx, 1)
 
 			addPods(endpoints.podStore, ns, tc.podsCount, 1, 0, ipv4only)
 
 			endpoints.serviceStore.Add(&v1.Service{
 				ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
 				Spec: v1.ServiceSpec{
-					Selector: map[string]string{"foo": "bar"},
-					Ports:    []v1.ServicePort{{Port: 80}},
+					Selector:   map[string]string{"foo": "bar"},
+					Ports:      []v1.ServicePort{{Port: 80}},
+					IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 				},
 			})
 
@@ -1769,21 +1926,22 @@ func TestPodAddsBatching(t *testing.T) {
 			ns := "other"
 			testServer, endpointsHandler := makeTestServer(t, ns)
 			defer testServer.Close()
-			endpoints := newController(testServer.URL, tc.batchPeriod)
-			stopCh := make(chan struct{})
-			defer close(stopCh)
+
+			tCtx := ktesting.Init(t)
+			endpoints := newController(tCtx, testServer.URL, tc.batchPeriod)
 			endpoints.podsSynced = alwaysReady
 			endpoints.servicesSynced = alwaysReady
 			endpoints.endpointsSynced = alwaysReady
 			endpoints.workerLoopPeriod = 10 * time.Millisecond
 
-			go endpoints.Run(context.TODO(), 1)
+			go endpoints.Run(tCtx, 1)
 
 			endpoints.serviceStore.Add(&v1.Service{
 				ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
 				Spec: v1.ServiceSpec{
-					Selector: map[string]string{"foo": "bar"},
-					Ports:    []v1.ServicePort{{Port: 80}},
+					Selector:   map[string]string{"foo": "bar"},
+					Ports:      []v1.ServicePort{{Port: 80}},
+					IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 				},
 			})
 
@@ -1891,23 +2049,24 @@ func TestPodDeleteBatching(t *testing.T) {
 			ns := "other"
 			testServer, endpointsHandler := makeTestServer(t, ns)
 			defer testServer.Close()
-			endpoints := newController(testServer.URL, tc.batchPeriod)
-			stopCh := make(chan struct{})
-			defer close(stopCh)
+
+			tCtx := ktesting.Init(t)
+			endpoints := newController(tCtx, testServer.URL, tc.batchPeriod)
 			endpoints.podsSynced = alwaysReady
 			endpoints.servicesSynced = alwaysReady
 			endpoints.endpointsSynced = alwaysReady
 			endpoints.workerLoopPeriod = 10 * time.Millisecond
 
-			go endpoints.Run(context.TODO(), 1)
+			go endpoints.Run(tCtx, 1)
 
 			addPods(endpoints.podStore, ns, tc.podsCount, 1, 0, ipv4only)
 
 			endpoints.serviceStore.Add(&v1.Service{
 				ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
 				Spec: v1.ServiceSpec{
-					Selector: map[string]string{"foo": "bar"},
-					Ports:    []v1.ServicePort{{Port: 80}},
+					Selector:   map[string]string{"foo": "bar"},
+					Ports:      []v1.ServicePort{{Port: 80}},
+					IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 				},
 			})
 
@@ -1935,7 +2094,9 @@ func TestSyncEndpointsServiceNotFound(t *testing.T) {
 	ns := metav1.NamespaceDefault
 	testServer, endpointsHandler := makeTestServer(t, ns)
 	defer testServer.Close()
-	endpoints := newController(testServer.URL, 0)
+
+	tCtx := ktesting.Init(t)
+	endpoints := newController(tCtx, testServer.URL, 0)
 	endpoints.endpointsStore.Add(&v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
@@ -1943,7 +2104,10 @@ func TestSyncEndpointsServiceNotFound(t *testing.T) {
 			ResourceVersion: "1",
 		},
 	})
-	endpoints.syncService(context.TODO(), ns+"/foo")
+	err := endpoints.syncService(tCtx, ns+"/foo")
+	if err != nil {
+		t.Errorf("Unexpected error syncing service %v", err)
+	}
 	endpointsHandler.ValidateRequestCount(t, 1)
 	endpointsHandler.ValidateRequest(t, "/api/v1/namespaces/"+ns+"/endpoints/foo", "DELETE", nil)
 }
@@ -1986,7 +2150,7 @@ func TestSyncServiceOverCapacity(t *testing.T) {
 		expectedAnnotation:  true,
 	}, {
 		name:                "annotation removed below capacity",
-		startingAnnotation:  utilpointer.StringPtr("truncated"),
+		startingAnnotation:  pointer.String("truncated"),
 		numExisting:         maxCapacity - 1,
 		numDesired:          maxCapacity - 1,
 		numDesiredNotReady:  0,
@@ -1995,7 +2159,7 @@ func TestSyncServiceOverCapacity(t *testing.T) {
 		expectedAnnotation:  false,
 	}, {
 		name:                "annotation was set to warning previously, annotation removed at capacity",
-		startingAnnotation:  utilpointer.StringPtr("warning"),
+		startingAnnotation:  pointer.String("warning"),
 		numExisting:         maxCapacity,
 		numDesired:          maxCapacity,
 		numDesiredNotReady:  0,
@@ -2004,7 +2168,7 @@ func TestSyncServiceOverCapacity(t *testing.T) {
 		expectedAnnotation:  false,
 	}, {
 		name:                "annotation was set to warning previously but still over capacity",
-		startingAnnotation:  utilpointer.StringPtr("warning"),
+		startingAnnotation:  pointer.String("warning"),
 		numExisting:         maxCapacity + 1,
 		numDesired:          maxCapacity + 1,
 		numDesiredNotReady:  0,
@@ -2013,7 +2177,7 @@ func TestSyncServiceOverCapacity(t *testing.T) {
 		expectedAnnotation:  true,
 	}, {
 		name:                "annotation removed at capacity",
-		startingAnnotation:  utilpointer.StringPtr("truncated"),
+		startingAnnotation:  pointer.String("truncated"),
 		numExisting:         maxCapacity,
 		numDesired:          maxCapacity,
 		numDesiredNotReady:  0,
@@ -2022,7 +2186,7 @@ func TestSyncServiceOverCapacity(t *testing.T) {
 		expectedAnnotation:  false,
 	}, {
 		name:                "no endpoints change, annotation value corrected",
-		startingAnnotation:  utilpointer.StringPtr("invalid"),
+		startingAnnotation:  pointer.String("invalid"),
 		numExisting:         maxCapacity + 1,
 		numDesired:          maxCapacity + 1,
 		numDesiredNotReady:  0,
@@ -2033,8 +2197,9 @@ func TestSyncServiceOverCapacity(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			tCtx := ktesting.Init(t)
 			ns := "test"
-			client, c := newFakeController(0 * time.Second)
+			client, c := newFakeController(tCtx, 0*time.Second)
 
 			addPods(c.podStore, ns, tc.numDesired, 1, tc.numDesiredNotReady, ipv4only)
 			pods := c.podStore.List()
@@ -2042,8 +2207,9 @@ func TestSyncServiceOverCapacity(t *testing.T) {
 			svc := &v1.Service{
 				ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
 				Spec: v1.ServiceSpec{
-					Selector: map[string]string{"foo": "bar"},
-					Ports:    []v1.ServicePort{{Port: 80}},
+					Selector:   map[string]string{"foo": "bar"},
+					Ports:      []v1.ServicePort{{Port: 80}},
+					IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 				},
 			}
 			c.serviceStore.Add(svc)
@@ -2067,11 +2233,17 @@ func TestSyncServiceOverCapacity(t *testing.T) {
 				endpoints.Annotations[v1.EndpointsOverCapacity] = *tc.startingAnnotation
 			}
 			c.endpointsStore.Add(endpoints)
-			client.CoreV1().Endpoints(ns).Create(context.TODO(), endpoints, metav1.CreateOptions{})
+			_, err := client.CoreV1().Endpoints(ns).Create(tCtx, endpoints, metav1.CreateOptions{})
+			if err != nil {
+				t.Fatalf("unexpected error creating endpoints: %v", err)
+			}
 
-			c.syncService(context.TODO(), fmt.Sprintf("%s/%s", ns, svc.Name))
+			err = c.syncService(tCtx, fmt.Sprintf("%s/%s", ns, svc.Name))
+			if err != nil {
+				t.Errorf("Unexpected error syncing service %v", err)
+			}
 
-			actualEndpoints, err := client.CoreV1().Endpoints(ns).Get(context.TODO(), endpoints.Name, metav1.GetOptions{})
+			actualEndpoints, err := client.CoreV1().Endpoints(ns).Get(tCtx, endpoints.Name, metav1.GetOptions{})
 			if err != nil {
 				t.Fatalf("unexpected error getting endpoints: %v", err)
 			}
@@ -2177,7 +2349,7 @@ func TestTruncateEndpoints(t *testing.T) {
 }
 
 func TestEndpointPortFromServicePort(t *testing.T) {
-	http := utilpointer.StringPtr("http")
+	http := pointer.String("http")
 	testCases := map[string]struct {
 		serviceAppProtocol           *string
 		expectedEndpointsAppProtocol *string
@@ -2222,20 +2394,22 @@ func TestMultipleServiceChanges(t *testing.T) {
 	blockDelete := make(chan struct{})
 	blockNextAction := make(chan struct{})
 	stopChan := make(chan struct{})
-	testServer := makeBlockingEndpointDeleteTestServer(t, controller, endpoint, blockDelete, blockNextAction, ns)
+	testServer := makeBlockingEndpointTestServer(t, controller, endpoint, nil, blockDelete, blockNextAction, ns)
 	defer testServer.Close()
 
-	*controller = *newController(testServer.URL, 0*time.Second)
+	tCtx := ktesting.Init(t)
+	*controller = *newController(tCtx, testServer.URL, 0*time.Second)
 	addPods(controller.podStore, ns, 1, 1, 0, ipv4only)
 
-	go func() { controller.Run(context.TODO(), 1) }()
+	go func() { controller.Run(tCtx, 1) }()
 
 	svc := &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
 		Spec: v1.ServiceSpec{
-			Selector:  map[string]string{"foo": "bar"},
-			ClusterIP: "None",
-			Ports:     nil,
+			Selector:   map[string]string{"foo": "bar"},
+			ClusterIP:  "None",
+			Ports:      nil,
+			IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
 		},
 	}
 
@@ -2266,11 +2440,323 @@ func TestMultipleServiceChanges(t *testing.T) {
 	close(stopChan)
 }
 
+// TestMultiplePodChanges tests that endpoints that are not updated because of an out of sync endpoints cache are
+// eventually resynced after multiple Pod changes.
+func TestMultiplePodChanges(t *testing.T) {
+	ns := metav1.NamespaceDefault
+
+	readyEndpoints := &v1.Endpoints{
+		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns, ResourceVersion: "1"},
+		Subsets: []v1.EndpointSubset{{
+			Addresses: []v1.EndpointAddress{
+				{IP: "1.2.3.4", NodeName: &emptyNodeName, TargetRef: &v1.ObjectReference{Kind: "Pod", Name: "pod0", Namespace: ns}},
+			},
+			Ports: []v1.EndpointPort{{Port: 8080, Protocol: v1.ProtocolTCP}},
+		}},
+	}
+	notReadyEndpoints := &v1.Endpoints{
+		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns, ResourceVersion: "2"},
+		Subsets: []v1.EndpointSubset{{
+			NotReadyAddresses: []v1.EndpointAddress{
+				{IP: "1.2.3.4", NodeName: &emptyNodeName, TargetRef: &v1.ObjectReference{Kind: "Pod", Name: "pod0", Namespace: ns}},
+			},
+			Ports: []v1.EndpointPort{{Port: 8080, Protocol: v1.ProtocolTCP}},
+		}},
+	}
+
+	controller := &endpointController{}
+	blockUpdate := make(chan struct{})
+	blockNextAction := make(chan struct{})
+	stopChan := make(chan struct{})
+	testServer := makeBlockingEndpointTestServer(t, controller, notReadyEndpoints, blockUpdate, nil, blockNextAction, ns)
+	defer testServer.Close()
+
+	tCtx := ktesting.Init(t)
+	*controller = *newController(tCtx, testServer.URL, 0*time.Second)
+	pod := testPod(ns, 0, 1, true, ipv4only)
+	_ = controller.podStore.Add(pod)
+	_ = controller.endpointsStore.Add(readyEndpoints)
+	_ = controller.serviceStore.Add(&v1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
+		Spec: v1.ServiceSpec{
+			Selector:   map[string]string{"foo": "bar"},
+			ClusterIP:  "10.0.0.1",
+			Ports:      []v1.ServicePort{{Port: 80, Protocol: "TCP", TargetPort: intstr.FromInt32(8080)}},
+			IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
+		},
+	})
+
+	go func() { controller.Run(tCtx, 1) }()
+
+	// Rapidly update the Pod: Ready -> NotReady -> Ready.
+	pod2 := pod.DeepCopy()
+	pod2.ResourceVersion = "2"
+	pod2.Status.Conditions[0].Status = v1.ConditionFalse
+	_ = controller.podStore.Update(pod2)
+	controller.updatePod(pod, pod2)
+	// blockNextAction should eventually unblock once server gets endpoints request.
+	waitForChanReceive(t, 1*time.Second, blockNextAction, "Pod Update should have caused a request to be sent to the test server")
+	// The endpoints update hasn't been applied to the cache yet.
+	pod3 := pod.DeepCopy()
+	pod3.ResourceVersion = "3"
+	pod3.Status.Conditions[0].Status = v1.ConditionTrue
+	_ = controller.podStore.Update(pod3)
+	controller.updatePod(pod2, pod3)
+	// It shouldn't get endpoints request as the endpoints in the cache is out-of-date.
+	timer := time.NewTimer(100 * time.Millisecond)
+	select {
+	case <-timer.C:
+	case <-blockNextAction:
+		t.Errorf("Pod Update shouldn't have caused a request to be sent to the test server")
+	}
+
+	// Applying the endpoints update to the cache should cause test server to update endpoints.
+	close(blockUpdate)
+	waitForChanReceive(t, 1*time.Second, blockNextAction, "Endpoints should have been updated")
+
+	close(blockNextAction)
+	close(stopChan)
+}
+
+func TestSyncServiceAddresses(t *testing.T) {
+	makeService := func(tolerateUnready bool) *v1.Service {
+		return &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "ns"},
+			Spec: v1.ServiceSpec{
+				Selector:                 map[string]string{"foo": "bar"},
+				PublishNotReadyAddresses: tolerateUnready,
+				Type:                     v1.ServiceTypeClusterIP,
+				ClusterIP:                "1.1.1.1",
+				Ports:                    []v1.ServicePort{{Port: 80}},
+				IPFamilies:               []v1.IPFamily{v1.IPv4Protocol},
+			},
+		}
+	}
+
+	makePod := func(phase v1.PodPhase, isReady bool, terminating bool) *v1.Pod {
+		statusCondition := v1.ConditionFalse
+		if isReady {
+			statusCondition = v1.ConditionTrue
+		}
+
+		now := metav1.Now()
+		deletionTimestamp := &now
+		if !terminating {
+			deletionTimestamp = nil
+		}
+		return &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:         "ns",
+				Name:              "fakepod",
+				DeletionTimestamp: deletionTimestamp,
+				Labels:            map[string]string{"foo": "bar"},
+			},
+			Spec: v1.PodSpec{
+				Containers: []v1.Container{{Ports: []v1.ContainerPort{
+					{Name: "port1", ContainerPort: int32(8080)},
+				}}},
+			},
+			Status: v1.PodStatus{
+				Phase: phase,
+				Conditions: []v1.PodCondition{
+					{
+						Type:   v1.PodReady,
+						Status: statusCondition,
+					},
+				},
+				PodIP: "10.1.1.1",
+				PodIPs: []v1.PodIP{
+					{IP: "10.1.1.1"},
+				},
+			},
+		}
+	}
+
+	testCases := []struct {
+		name            string
+		pod             *v1.Pod
+		service         *v1.Service
+		expectedReady   int
+		expectedUnready int
+	}{
+		{
+			name:            "pod running phase",
+			pod:             makePod(v1.PodRunning, true, false),
+			service:         makeService(false),
+			expectedReady:   1,
+			expectedUnready: 0,
+		},
+		{
+			name:            "pod running phase being deleted",
+			pod:             makePod(v1.PodRunning, true, true),
+			service:         makeService(false),
+			expectedReady:   0,
+			expectedUnready: 0,
+		},
+		{
+			name:            "pod unknown phase container ready",
+			pod:             makePod(v1.PodUnknown, true, false),
+			service:         makeService(false),
+			expectedReady:   1,
+			expectedUnready: 0,
+		},
+		{
+			name:            "pod unknown phase container ready being deleted",
+			pod:             makePod(v1.PodUnknown, true, true),
+			service:         makeService(false),
+			expectedReady:   0,
+			expectedUnready: 0,
+		},
+		{
+			name:            "pod pending phase container ready",
+			pod:             makePod(v1.PodPending, true, false),
+			service:         makeService(false),
+			expectedReady:   1,
+			expectedUnready: 0,
+		},
+		{
+			name:            "pod pending phase container ready being deleted",
+			pod:             makePod(v1.PodPending, true, true),
+			service:         makeService(false),
+			expectedReady:   0,
+			expectedUnready: 0,
+		},
+		{
+			name:            "pod unknown phase container not ready",
+			pod:             makePod(v1.PodUnknown, false, false),
+			service:         makeService(false),
+			expectedReady:   0,
+			expectedUnready: 1,
+		},
+		{
+			name:            "pod pending phase container not ready",
+			pod:             makePod(v1.PodPending, false, false),
+			service:         makeService(false),
+			expectedReady:   0,
+			expectedUnready: 1,
+		},
+		{
+			name:            "pod failed phase",
+			pod:             makePod(v1.PodFailed, false, false),
+			service:         makeService(false),
+			expectedReady:   0,
+			expectedUnready: 0,
+		},
+		{
+			name:            "pod succeeded phase",
+			pod:             makePod(v1.PodSucceeded, false, false),
+			service:         makeService(false),
+			expectedReady:   0,
+			expectedUnready: 0,
+		},
+		{
+			name:            "pod running phase and tolerate unready",
+			pod:             makePod(v1.PodRunning, false, false),
+			service:         makeService(true),
+			expectedReady:   1,
+			expectedUnready: 0,
+		},
+		{
+			name:            "pod running phase and tolerate unready being deleted",
+			pod:             makePod(v1.PodRunning, false, true),
+			service:         makeService(true),
+			expectedReady:   1,
+			expectedUnready: 0,
+		},
+		{
+			name:            "pod unknown phase and tolerate unready",
+			pod:             makePod(v1.PodUnknown, false, false),
+			service:         makeService(true),
+			expectedReady:   1,
+			expectedUnready: 0,
+		},
+		{
+			name:            "pod unknown phase and tolerate unready being deleted",
+			pod:             makePod(v1.PodUnknown, false, true),
+			service:         makeService(true),
+			expectedReady:   1,
+			expectedUnready: 0,
+		},
+		{
+			name:            "pod pending phase and tolerate unready",
+			pod:             makePod(v1.PodPending, false, false),
+			service:         makeService(true),
+			expectedReady:   1,
+			expectedUnready: 0,
+		},
+		{
+			name:            "pod pending phase and tolerate unready being deleted",
+			pod:             makePod(v1.PodPending, false, true),
+			service:         makeService(true),
+			expectedReady:   1,
+			expectedUnready: 0,
+		},
+		{
+			name:            "pod failed phase and tolerate unready",
+			pod:             makePod(v1.PodFailed, false, false),
+			service:         makeService(true),
+			expectedReady:   0,
+			expectedUnready: 0,
+		},
+		{
+			name:            "pod succeeded phase and tolerate unready endpoints",
+			pod:             makePod(v1.PodSucceeded, false, false),
+			service:         makeService(true),
+			expectedReady:   0,
+			expectedUnready: 0,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tCtx := ktesting.Init(t)
+
+			ns := tc.service.Namespace
+			client, c := newFakeController(tCtx, 0*time.Second)
+
+			err := c.podStore.Add(tc.pod)
+			if err != nil {
+				t.Errorf("Unexpected error adding pod %v", err)
+			}
+			err = c.serviceStore.Add(tc.service)
+			if err != nil {
+				t.Errorf("Unexpected error adding service %v", err)
+			}
+			err = c.syncService(tCtx, fmt.Sprintf("%s/%s", ns, tc.service.Name))
+			if err != nil {
+				t.Errorf("Unexpected error syncing service %v", err)
+			}
+
+			endpoints, err := client.CoreV1().Endpoints(ns).Get(tCtx, tc.service.Name, metav1.GetOptions{})
+			if err != nil {
+				t.Errorf("Unexpected error %v", err)
+			}
+
+			readyEndpoints := 0
+			unreadyEndpoints := 0
+			for _, subset := range endpoints.Subsets {
+				readyEndpoints += len(subset.Addresses)
+				unreadyEndpoints += len(subset.NotReadyAddresses)
+			}
+
+			if tc.expectedReady != readyEndpoints {
+				t.Errorf("Expected %d ready endpoints, got %d", tc.expectedReady, readyEndpoints)
+			}
+
+			if tc.expectedUnready != unreadyEndpoints {
+				t.Errorf("Expected %d ready endpoints, got %d", tc.expectedUnready, unreadyEndpoints)
+			}
+		})
+	}
+}
+
 func TestEndpointsDeletionEvents(t *testing.T) {
 	ns := metav1.NamespaceDefault
 	testServer, _ := makeTestServer(t, ns)
 	defer testServer.Close()
-	controller := newController(testServer.URL, 0)
+
+	tCtx := ktesting.Init(t)
+	controller := newController(tCtx, testServer.URL, 0)
 	store := controller.endpointsStore
 	ep1 := &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
@@ -2301,7 +2787,105 @@ func waitForChanReceive(t *testing.T, timeout time.Duration, receivingChan chan 
 	timer := time.NewTimer(timeout)
 	select {
 	case <-timer.C:
-		t.Errorf(errorMsg)
+		t.Error(errorMsg)
 	case <-receivingChan:
+	}
+}
+
+func TestEndpointSubsetsEqualIgnoreResourceVersion(t *testing.T) {
+	copyAndMutateEndpointSubset := func(orig *v1.EndpointSubset, mutator func(*v1.EndpointSubset)) *v1.EndpointSubset {
+		newSubSet := orig.DeepCopy()
+		mutator(newSubSet)
+		return newSubSet
+	}
+	es1 := &v1.EndpointSubset{
+		Addresses: []v1.EndpointAddress{
+			{
+				IP:        "1.1.1.1",
+				TargetRef: &v1.ObjectReference{Kind: "Pod", Name: "pod1-1", Namespace: "ns", ResourceVersion: "1"},
+			},
+		},
+		NotReadyAddresses: []v1.EndpointAddress{
+			{
+				IP:        "1.1.1.2",
+				TargetRef: &v1.ObjectReference{Kind: "Pod", Name: "pod1-2", Namespace: "ns2", ResourceVersion: "2"},
+			},
+		},
+		Ports: []v1.EndpointPort{{Port: 8081, Protocol: "TCP"}},
+	}
+	es2 := &v1.EndpointSubset{
+		Addresses: []v1.EndpointAddress{
+			{
+				IP:        "2.2.2.1",
+				TargetRef: &v1.ObjectReference{Kind: "Pod", Name: "pod2-1", Namespace: "ns", ResourceVersion: "3"},
+			},
+		},
+		NotReadyAddresses: []v1.EndpointAddress{
+			{
+				IP:        "2.2.2.2",
+				TargetRef: &v1.ObjectReference{Kind: "Pod", Name: "pod2-2", Namespace: "ns2", ResourceVersion: "4"},
+			},
+		},
+		Ports: []v1.EndpointPort{{Port: 8082, Protocol: "TCP"}},
+	}
+	tests := []struct {
+		name     string
+		subsets1 []v1.EndpointSubset
+		subsets2 []v1.EndpointSubset
+		expected bool
+	}{
+		{
+			name:     "Subsets removed",
+			subsets1: []v1.EndpointSubset{*es1, *es2},
+			subsets2: []v1.EndpointSubset{*es1},
+			expected: false,
+		},
+		{
+			name:     "Ready Pod IP changed",
+			subsets1: []v1.EndpointSubset{*es1, *es2},
+			subsets2: []v1.EndpointSubset{*copyAndMutateEndpointSubset(es1, func(es *v1.EndpointSubset) {
+				es.Addresses[0].IP = "1.1.1.10"
+			}), *es2},
+			expected: false,
+		},
+		{
+			name:     "NotReady Pod IP changed",
+			subsets1: []v1.EndpointSubset{*es1, *es2},
+			subsets2: []v1.EndpointSubset{*es1, *copyAndMutateEndpointSubset(es2, func(es *v1.EndpointSubset) {
+				es.NotReadyAddresses[0].IP = "2.2.2.10"
+			})},
+			expected: false,
+		},
+		{
+			name:     "Pod ResourceVersion changed",
+			subsets1: []v1.EndpointSubset{*es1, *es2},
+			subsets2: []v1.EndpointSubset{*es1, *copyAndMutateEndpointSubset(es2, func(es *v1.EndpointSubset) {
+				es.Addresses[0].TargetRef.ResourceVersion = "100"
+			})},
+			expected: true,
+		},
+		{
+			name:     "Pod ResourceVersion removed",
+			subsets1: []v1.EndpointSubset{*es1, *es2},
+			subsets2: []v1.EndpointSubset{*es1, *copyAndMutateEndpointSubset(es2, func(es *v1.EndpointSubset) {
+				es.Addresses[0].TargetRef.ResourceVersion = ""
+			})},
+			expected: true,
+		},
+		{
+			name:     "Ports changed",
+			subsets1: []v1.EndpointSubset{*es1, *es2},
+			subsets2: []v1.EndpointSubset{*es1, *copyAndMutateEndpointSubset(es1, func(es *v1.EndpointSubset) {
+				es.Ports[0].Port = 8082
+			})},
+			expected: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := endpointSubsetsEqualIgnoreResourceVersion(tt.subsets1, tt.subsets2); got != tt.expected {
+				t.Errorf("semanticIgnoreResourceVersion.DeepEqual() = %v, expected %v", got, tt.expected)
+			}
+		})
 	}
 }

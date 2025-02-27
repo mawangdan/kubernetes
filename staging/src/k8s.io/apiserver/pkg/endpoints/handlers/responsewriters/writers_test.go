@@ -19,6 +19,7 @@ package responsewriters
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -35,11 +36,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	v1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/diff"
+	rand2 "k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/apiserver/pkg/features"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
@@ -53,8 +55,6 @@ func TestSerializeObjectParallel(t *testing.T) {
 	type test struct {
 		name string
 
-		compressionEnabled bool
-
 		mediaType  string
 		out        []byte
 		outErrs    []error
@@ -67,10 +67,9 @@ func TestSerializeObjectParallel(t *testing.T) {
 	}
 	newTest := func() test {
 		return test{
-			name:               "compress on gzip",
-			compressionEnabled: true,
-			out:                largePayload,
-			mediaType:          "application/json",
+			name:      "compress on gzip",
+			out:       largePayload,
+			mediaType: "application/json",
 			req: &http.Request{
 				Header: http.Header{
 					"Accept-Encoding": []string{"gzip"},
@@ -85,6 +84,7 @@ func TestSerializeObjectParallel(t *testing.T) {
 			},
 		}
 	}
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.APIResponseCompression, true)
 	for i := 0; i < 100; i++ {
 		ctt := newTest()
 		t.Run(ctt.name, func(t *testing.T) {
@@ -94,7 +94,6 @@ func TestSerializeObjectParallel(t *testing.T) {
 				}
 			}()
 			t.Parallel()
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.APIResponseCompression, ctt.compressionEnabled)()
 
 			encoder := &fakeEncoder{
 				buf:  ctt.out,
@@ -114,7 +113,7 @@ func TestSerializeObjectParallel(t *testing.T) {
 				t.Fatalf("unexpected code: %v", result.StatusCode)
 			}
 			if !reflect.DeepEqual(result.Header, ctt.wantHeaders) {
-				t.Fatal(diff.ObjectReflectDiff(ctt.wantHeaders, result.Header))
+				t.Fatal(cmp.Diff(ctt.wantHeaders, result.Header))
 			}
 		})
 	}
@@ -329,7 +328,7 @@ func TestSerializeObject(t *testing.T) {
 			compressionEnabled: true,
 			statusCode:         http.StatusInternalServerError,
 			out:                smallPayload,
-			outErrs:            []error{fmt.Errorf(string(largePayload)), fmt.Errorf("bad2")},
+			outErrs:            []error{errors.New(string(largePayload)), errors.New("bad2")},
 			mediaType:          "application/json",
 			req: &http.Request{
 				Header: http.Header{
@@ -348,7 +347,7 @@ func TestSerializeObject(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.APIResponseCompression, tt.compressionEnabled)()
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.APIResponseCompression, tt.compressionEnabled)
 
 			encoder := &fakeEncoder{
 				buf:  tt.out,
@@ -364,12 +363,267 @@ func TestSerializeObject(t *testing.T) {
 				t.Fatalf("unexpected code: %v", result.StatusCode)
 			}
 			if !reflect.DeepEqual(result.Header, tt.wantHeaders) {
-				t.Fatal(diff.ObjectReflectDiff(tt.wantHeaders, result.Header))
+				t.Fatal(cmp.Diff(tt.wantHeaders, result.Header))
 			}
 			body, _ := ioutil.ReadAll(result.Body)
 			if !bytes.Equal(tt.wantBody, body) {
 				t.Fatalf("wanted:\n%s\ngot:\n%s", hex.Dump(tt.wantBody), hex.Dump(body))
 			}
+		})
+	}
+}
+
+func TestDeferredResponseWriter_Write(t *testing.T) {
+	smallChunk := bytes.Repeat([]byte("b"), defaultGzipThresholdBytes-1)
+	largeChunk := bytes.Repeat([]byte("b"), defaultGzipThresholdBytes+1)
+
+	tests := []struct {
+		name          string
+		chunks        [][]byte
+		expectGzip    bool
+		expectHeaders http.Header
+	}{
+		{
+			name:          "no writes",
+			chunks:        nil,
+			expectGzip:    false,
+			expectHeaders: http.Header{},
+		},
+		{
+			name:       "one empty write",
+			chunks:     [][]byte{{}},
+			expectGzip: false,
+			expectHeaders: http.Header{
+				"Content-Type": []string{"text/plain"},
+			},
+		},
+		{
+			name:       "one single byte write",
+			chunks:     [][]byte{{'{'}},
+			expectGzip: false,
+			expectHeaders: http.Header{
+				"Content-Type": []string{"text/plain"},
+			},
+		},
+		{
+			name:       "one small chunk write",
+			chunks:     [][]byte{smallChunk},
+			expectGzip: false,
+			expectHeaders: http.Header{
+				"Content-Type": []string{"text/plain"},
+			},
+		},
+		{
+			name:       "two small chunk writes",
+			chunks:     [][]byte{smallChunk, smallChunk},
+			expectGzip: false,
+			expectHeaders: http.Header{
+				"Content-Type": []string{"text/plain"},
+			},
+		},
+		{
+			name:       "one single byte and one small chunk write",
+			chunks:     [][]byte{{'{'}, smallChunk},
+			expectGzip: false,
+			expectHeaders: http.Header{
+				"Content-Type": []string{"text/plain"},
+			},
+		},
+		{
+			name:       "two single bytes and one small chunk write",
+			chunks:     [][]byte{{'{'}, {'{'}, smallChunk},
+			expectGzip: true,
+			expectHeaders: http.Header{
+				"Content-Type":     []string{"text/plain"},
+				"Content-Encoding": []string{"gzip"},
+				"Vary":             []string{"Accept-Encoding"},
+			},
+		},
+		{
+			name:       "one large chunk writes",
+			chunks:     [][]byte{largeChunk},
+			expectGzip: true,
+			expectHeaders: http.Header{
+				"Content-Type":     []string{"text/plain"},
+				"Content-Encoding": []string{"gzip"},
+				"Vary":             []string{"Accept-Encoding"},
+			},
+		},
+		{
+			name:       "two large chunk writes",
+			chunks:     [][]byte{largeChunk, largeChunk},
+			expectGzip: true,
+			expectHeaders: http.Header{
+				"Content-Type":     []string{"text/plain"},
+				"Content-Encoding": []string{"gzip"},
+				"Vary":             []string{"Accept-Encoding"},
+			},
+		},
+		{
+			name:       "one small chunk and one large chunk write",
+			chunks:     [][]byte{smallChunk, largeChunk},
+			expectGzip: false,
+			expectHeaders: http.Header{
+				"Content-Type": []string{"text/plain"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockResponseWriter := httptest.NewRecorder()
+
+			drw := &deferredResponseWriter{
+				mediaType:       "text/plain",
+				statusCode:      200,
+				contentEncoding: "gzip",
+				hw:              mockResponseWriter,
+				ctx:             context.Background(),
+			}
+
+			fullPayload := []byte{}
+
+			for _, chunk := range tt.chunks {
+				n, err := drw.Write(chunk)
+
+				if err != nil {
+					t.Fatalf("unexpected error while writing chunk: %v", err)
+				}
+				if n != len(chunk) {
+					t.Errorf("write is not complete, expected: %d bytes, written: %d bytes", len(chunk), n)
+				}
+
+				fullPayload = append(fullPayload, chunk...)
+			}
+
+			err := drw.Close()
+			if err != nil {
+				t.Fatalf("unexpected error when closing deferredResponseWriter: %v", err)
+			}
+
+			res := mockResponseWriter.Result()
+
+			if res.StatusCode != http.StatusOK {
+				t.Fatalf("status code is not writtend properly, expected: 200, got: %d", res.StatusCode)
+			}
+			if !reflect.DeepEqual(res.Header, tt.expectHeaders) {
+				t.Fatal(cmp.Diff(tt.expectHeaders, res.Header))
+			}
+
+			resBytes, err := io.ReadAll(res.Body)
+			if err != nil {
+				t.Fatalf("unexpected error occurred while reading response body: %v", err)
+			}
+
+			if tt.expectGzip {
+				gr, err := gzip.NewReader(bytes.NewReader(resBytes))
+				if err != nil {
+					t.Fatalf("failed to create gzip reader: %v", err)
+				}
+
+				decompressed, err := io.ReadAll(gr)
+				if err != nil {
+					t.Fatalf("failed to decompress: %v", err)
+				}
+
+				if !bytes.Equal(fullPayload, decompressed) {
+					t.Errorf("payload mismatch, expected: %s, got: %s", fullPayload, decompressed)
+				}
+			} else {
+				if !bytes.Equal(fullPayload, resBytes) {
+					t.Errorf("payload mismatch, expected: %s, got: %s", fullPayload, resBytes)
+				}
+			}
+		})
+	}
+}
+
+func benchmarkChunkingGzip(b *testing.B, count int, chunk []byte) {
+	mockResponseWriter := httptest.NewRecorder()
+	mockResponseWriter.Body = nil
+
+	drw := &deferredResponseWriter{
+		mediaType:       "text/plain",
+		statusCode:      200,
+		contentEncoding: "gzip",
+		hw:              mockResponseWriter,
+		ctx:             context.Background(),
+	}
+	b.ResetTimer()
+	for i := 0; i < count; i++ {
+		n, err := drw.Write(chunk)
+		if err != nil {
+			b.Fatalf("unexpected error while writing chunk: %v", err)
+		}
+		if n != len(chunk) {
+			b.Errorf("write is not complete, expected: %d bytes, written: %d bytes", len(chunk), n)
+		}
+	}
+	err := drw.Close()
+	if err != nil {
+		b.Fatalf("unexpected error when closing deferredResponseWriter: %v", err)
+	}
+	res := mockResponseWriter.Result()
+	if res.StatusCode != http.StatusOK {
+		b.Fatalf("status code is not writtend properly, expected: 200, got: %d", res.StatusCode)
+	}
+}
+
+func BenchmarkChunkingGzip(b *testing.B) {
+	tests := []struct {
+		count int
+		size  int
+	}{
+		{
+			count: 100,
+			size:  1_000,
+		},
+		{
+			count: 100,
+			size:  100_000,
+		},
+		{
+			count: 1_000,
+			size:  100_000,
+		},
+		{
+			count: 1_000,
+			size:  1_000_000,
+		},
+		{
+			count: 10_000,
+			size:  100_000,
+		},
+		{
+			count: 100_000,
+			size:  10_000,
+		},
+		{
+			count: 1,
+			size:  100_000,
+		},
+		{
+			count: 1,
+			size:  1_000_000,
+		},
+		{
+			count: 1,
+			size:  10_000_000,
+		},
+		{
+			count: 1,
+			size:  100_000_000,
+		},
+		{
+			count: 1,
+			size:  1_000_000_000,
+		},
+	}
+
+	for _, t := range tests {
+		b.Run(fmt.Sprintf("Count=%d/Size=%d", t.count, t.size), func(b *testing.B) {
+			chunk := []byte(rand2.String(t.size))
+			benchmarkChunkingGzip(b, t.count, chunk)
 		})
 	}
 }
@@ -462,7 +716,7 @@ func benchmarkSerializeObject(b *testing.B, payload []byte) {
 		},
 		URL: &url.URL{Path: "/path"},
 	}
-	defer featuregatetesting.SetFeatureGateDuringTest(b, utilfeature.DefaultFeatureGate, features.APIResponseCompression, true)()
+	featuregatetesting.SetFeatureGateDuringTest(b, utilfeature.DefaultFeatureGate, features.APIResponseCompression, true)
 
 	encoder := &fakeEncoder{
 		buf: payload,

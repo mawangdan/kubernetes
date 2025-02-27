@@ -78,11 +78,20 @@ spec:
     spec:
       priorityClassName: system-cluster-critical
       serviceAccountName: coredns
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: k8s-app
+                  operator: In
+                  values: ["kube-dns"]
+              topologyKey: kubernetes.io/hostname
       tolerations:
       - key: CriticalAddonsOnly
         operator: Exists
-      - key: {{ .OldControlPlaneTaintKey }}
-        effect: NoSchedule
       - key: {{ .ControlPlaneTaintKey }}
         effect: NoSchedule
       nodeSelector:
@@ -132,7 +141,7 @@ spec:
             add:
             - NET_BIND_SERVICE
             drop:
-            - all
+            - ALL
           readOnlyRootFilesystem: true
       dnsPolicy: Default
       volumes:
@@ -169,6 +178,11 @@ data:
            max_concurrent 1000
         }
         cache 30
+        {{- if .DNSDomain }} {
+           disable success {{ .DNSDomain }}
+           disable denial {{ .DNSDomain }}
+        }
+        {{- end }}
         loop
         reload
         loadbalance
@@ -191,12 +205,6 @@ rules:
   verbs:
   - list
   - watch
-- apiGroups:
-  - ""
-  resources:
-  - nodes
-  verbs:
-  - get
 - apiGroups:
   - discovery.k8s.io
   resources:

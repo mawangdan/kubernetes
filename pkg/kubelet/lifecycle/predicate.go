@@ -21,10 +21,59 @@ import (
 	"runtime"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/klog/v2"
 	v1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
+	"k8s.io/kubernetes/pkg/kubelet/types"
 	"k8s.io/kubernetes/pkg/scheduler"
 	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/tainttoleration"
+)
+
+const (
+	// PodOSSelectorNodeLabelDoesNotMatch is used to denote that the pod was
+	// rejected admission to the node because the pod's node selector
+	// corresponding to kubernetes.io/os label didn't match the node label.
+	PodOSSelectorNodeLabelDoesNotMatch = "PodOSSelectorNodeLabelDoesNotMatch"
+
+	// PodOSNotSupported is used to denote that the pod was rejected admission
+	// to the node because the pod's OS field didn't match the node OS.
+	PodOSNotSupported = "PodOSNotSupported"
+
+	// InvalidNodeInfo is used to denote that the pod was rejected admission
+	// to the node because the kubelet was unable to retrieve the node info.
+	InvalidNodeInfo = "InvalidNodeInfo"
+
+	// InitContainerRestartPolicyForbidden is used to denote that the pod was
+	// rejected admission to the node because it uses a restart policy other
+	// than Always for some of its init containers.
+	InitContainerRestartPolicyForbidden = "InitContainerRestartPolicyForbidden"
+
+	// UnexpectedAdmissionError is used to denote that the pod was rejected
+	// admission to the node because of an error during admission that could not
+	// be categorized.
+	UnexpectedAdmissionError = "UnexpectedAdmissionError"
+
+	// UnknownReason is used to denote that the pod was rejected admission to
+	// the node because a predicate failed for a reason that could not be
+	// determined.
+	UnknownReason = "UnknownReason"
+
+	// UnexpectedPredicateFailureType is used to denote that the pod was
+	// rejected admission to the node because a predicate returned a reason
+	// object that was not an InsufficientResourceError or a PredicateFailureError.
+	UnexpectedPredicateFailureType = "UnexpectedPredicateFailureType"
+
+	// Prefix for admission reason when kubelet rejects a pod due to insufficient
+	// resources available.
+	InsufficientResourcePrefix = "OutOf"
+
+	// These reasons are used to denote that the pod has reject admission
+	// to the node because there's not enough resources to run the pod.
+	OutOfCPU              = "OutOfcpu"
+	OutOfMemory           = "OutOfmemory"
+	OutOfEphemeralStorage = "OutOfephemeral-storage"
+	OutOfPods             = "OutOfpods"
 )
 
 type getNodeAnyWayFuncType func() (*v1.Node, error)
@@ -61,21 +110,39 @@ func (w *predicateAdmitHandler) Admit(attrs *PodAdmitAttributes) PodAdmitResult 
 		klog.ErrorS(err, "Cannot get Node info")
 		return PodAdmitResult{
 			Admit:   false,
-			Reason:  "InvalidNodeInfo",
+			Reason:  InvalidNodeInfo,
 			Message: "Kubelet cannot get node info.",
 		}
 	}
 	admitPod := attrs.Pod
+
+	// perform the checks that preemption will not help first to avoid meaningless pod eviction
+	if rejectPodAdmissionBasedOnOSSelector(admitPod, node) {
+		return PodAdmitResult{
+			Admit:   false,
+			Reason:  PodOSSelectorNodeLabelDoesNotMatch,
+			Message: "Failed to admit pod as the `kubernetes.io/os` label doesn't match node label",
+		}
+	}
+	if rejectPodAdmissionBasedOnOSField(admitPod) {
+		return PodAdmitResult{
+			Admit:   false,
+			Reason:  PodOSNotSupported,
+			Message: "Failed to admit pod as the OS field doesn't match node OS",
+		}
+	}
+
 	pods := attrs.OtherPods
 	nodeInfo := schedulerframework.NewNodeInfo(pods...)
 	nodeInfo.SetNode(node)
+
 	// ensure the node has enough plugin resources for that required in pods
 	if err = w.pluginResourceUpdateFunc(nodeInfo, attrs); err != nil {
 		message := fmt.Sprintf("Update plugin resources failed due to %v, which is unexpected.", err)
 		klog.InfoS("Failed to admit pod", "pod", klog.KObj(admitPod), "message", message)
 		return PodAdmitResult{
 			Admit:   false,
-			Reason:  "UnexpectedAdmissionError",
+			Reason:  UnexpectedAdmissionError,
 			Message: message,
 		}
 	}
@@ -100,7 +167,7 @@ func (w *predicateAdmitHandler) Admit(attrs *PodAdmitAttributes) PodAdmitResult 
 			klog.InfoS("Failed to admit pod, unexpected error while attempting to recover from admission failure", "pod", klog.KObj(admitPod), "err", err)
 			return PodAdmitResult{
 				Admit:   fit,
-				Reason:  "UnexpectedAdmissionError",
+				Reason:  UnexpectedAdmissionError,
 				Message: message,
 			}
 		}
@@ -113,7 +180,7 @@ func (w *predicateAdmitHandler) Admit(attrs *PodAdmitAttributes) PodAdmitResult 
 			klog.InfoS("Failed to admit pod: GeneralPredicates failed due to unknown reason, which is unexpected", "pod", klog.KObj(admitPod))
 			return PodAdmitResult{
 				Admit:   fit,
-				Reason:  "UnknownReason",
+				Reason:  UnknownReason,
 				Message: message,
 			}
 		}
@@ -125,11 +192,22 @@ func (w *predicateAdmitHandler) Admit(attrs *PodAdmitAttributes) PodAdmitResult 
 			message = re.Error()
 			klog.V(2).InfoS("Predicate failed on Pod", "pod", klog.KObj(admitPod), "err", message)
 		case *InsufficientResourceError:
-			reason = fmt.Sprintf("OutOf%s", re.ResourceName)
+			switch re.ResourceName {
+			case v1.ResourceCPU:
+				reason = OutOfCPU
+			case v1.ResourceMemory:
+				reason = OutOfMemory
+			case v1.ResourceEphemeralStorage:
+				reason = OutOfEphemeralStorage
+			case v1.ResourcePods:
+				reason = OutOfPods
+			default:
+				reason = fmt.Sprintf("%s%s", InsufficientResourcePrefix, re.ResourceName)
+			}
 			message = re.Error()
 			klog.V(2).InfoS("Predicate failed on Pod", "pod", klog.KObj(admitPod), "err", message)
 		default:
-			reason = "UnexpectedPredicateFailureType"
+			reason = UnexpectedPredicateFailureType
 			message = fmt.Sprintf("GeneralPredicates failed due to %v, which is unexpected.", r)
 			klog.InfoS("Failed to admit pod", "pod", klog.KObj(admitPod), "err", message)
 		}
@@ -137,21 +215,6 @@ func (w *predicateAdmitHandler) Admit(attrs *PodAdmitAttributes) PodAdmitResult 
 			Admit:   fit,
 			Reason:  reason,
 			Message: message,
-		}
-	}
-	if rejectPodAdmissionBasedOnOSSelector(admitPod, node) {
-		return PodAdmitResult{
-			Admit:   false,
-			Reason:  "PodOSSelectorNodeLabelDoesNotMatch",
-			Message: "Failed to admit pod as the `kubernetes.io/os` label doesn't match node label",
-		}
-	}
-	// By this time, node labels should have been synced, this helps in identifying the pod with the usage.
-	if rejectPodAdmissionBasedOnOSField(admitPod) {
-		return PodAdmitResult{
-			Admit:   false,
-			Reason:  "PodOSNotSupported",
-			Message: "Failed to admit pod as the OS field doesn't match node OS",
 		}
 	}
 	return PodAdmitResult{
@@ -182,7 +245,7 @@ func rejectPodAdmissionBasedOnOSSelector(pod *v1.Pod, node *v1.Node) bool {
 
 // rejectPodAdmissionBasedOnOSField rejects pods if their OS field doesn't match runtime.GOOS.
 // TODO: Relax this restriction when we start supporting LCOW in kubernetes where podOS may not match
-// 		 node's OS.
+// node's OS.
 func rejectPodAdmissionBasedOnOSField(pod *v1.Pod) bool {
 	if pod.Spec.OS == nil {
 		return false
@@ -192,21 +255,26 @@ func rejectPodAdmissionBasedOnOSField(pod *v1.Pod) bool {
 }
 
 func removeMissingExtendedResources(pod *v1.Pod, nodeInfo *schedulerframework.NodeInfo) *v1.Pod {
-	podCopy := pod.DeepCopy()
-	for i, c := range pod.Spec.Containers {
-		// We only handle requests in Requests but not Limits because the
-		// PodFitsResources predicate, to which the result pod will be passed,
-		// does not use Limits.
-		podCopy.Spec.Containers[i].Resources.Requests = make(v1.ResourceList)
-		for rName, rQuant := range c.Resources.Requests {
-			if v1helper.IsExtendedResourceName(rName) {
-				if _, found := nodeInfo.Allocatable.ScalarResources[rName]; !found {
-					continue
+	filterExtendedResources := func(containers []v1.Container) {
+		for i, c := range containers {
+			// We only handle requests in Requests but not Limits because the
+			// PodFitsResources predicate, to which the result pod will be passed,
+			// does not use Limits.
+			filteredResources := make(v1.ResourceList)
+			for rName, rQuant := range c.Resources.Requests {
+				if v1helper.IsExtendedResourceName(rName) {
+					if _, found := nodeInfo.Allocatable.ScalarResources[rName]; !found {
+						continue
+					}
 				}
+				filteredResources[rName] = rQuant
 			}
-			podCopy.Spec.Containers[i].Resources.Requests[rName] = rQuant
+			containers[i].Resources.Requests = filteredResources
 		}
 	}
+	podCopy := pod.DeepCopy()
+	filterExtendedResources(podCopy.Spec.Containers)
+	filterExtendedResources(podCopy.Spec.InitContainers)
 	return podCopy
 }
 
@@ -246,7 +314,7 @@ type PredicateFailureError struct {
 }
 
 func (e *PredicateFailureError) Error() string {
-	return fmt.Sprintf("Predicate %s failed", e.PredicateName)
+	return fmt.Sprintf("Predicate %s failed: %s", e.PredicateName, e.PredicateDesc)
 }
 
 // GetReason returns the reason of the PredicateFailureError.
@@ -270,5 +338,17 @@ func generalFilter(pod *v1.Pod, nodeInfo *schedulerframework.NodeInfo) []Predica
 			reasons = append(reasons, &PredicateFailureError{r.Name, r.Reason})
 		}
 	}
+
+	// Check taint/toleration except for static pods
+	if !types.IsStaticPod(pod) {
+		_, isUntolerated := corev1.FindMatchingUntoleratedTaint(nodeInfo.Node().Spec.Taints, pod.Spec.Tolerations, func(t *v1.Taint) bool {
+			// Kubelet is only interested in the NoExecute taint.
+			return t.Effect == v1.TaintEffectNoExecute
+		})
+		if isUntolerated {
+			reasons = append(reasons, &PredicateFailureError{tainttoleration.Name, tainttoleration.ErrReasonNotMatch})
+		}
+	}
+
 	return reasons
 }

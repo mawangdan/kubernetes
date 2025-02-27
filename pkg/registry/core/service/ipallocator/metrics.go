@@ -18,6 +18,7 @@ package ipallocator
 
 import (
 	"sync"
+	"time"
 
 	"k8s.io/component-base/metrics"
 	"k8s.io/component-base/metrics/legacyregistry"
@@ -51,7 +52,7 @@ var (
 		},
 		[]string{"cidr"},
 	)
-	// clusterIPAllocation counts the total number of ClusterIP allocation.
+	// clusterIPAllocation counts the total number of ClusterIP allocation and allocation mode: static or dynamic.
 	clusterIPAllocations = metrics.NewCounterVec(
 		&metrics.CounterOpts{
 			Namespace:      namespace,
@@ -60,15 +61,26 @@ var (
 			Help:           "Number of Cluster IPs allocations",
 			StabilityLevel: metrics.ALPHA,
 		},
-		[]string{"cidr"},
+		[]string{"cidr", "scope"},
 	)
-	// clusterIPAllocationErrors counts the number of error trying to allocate a ClusterIP.
+	// clusterIPAllocationErrors counts the number of error trying to allocate a ClusterIP and allocation mode: static or dynamic.
 	clusterIPAllocationErrors = metrics.NewCounterVec(
 		&metrics.CounterOpts{
 			Namespace:      namespace,
 			Subsystem:      subsystem,
 			Name:           "allocation_errors_total",
 			Help:           "Number of errors trying to allocate Cluster IPs",
+			StabilityLevel: metrics.ALPHA,
+		},
+		[]string{"cidr", "scope"},
+	)
+	clusterIPAllocationLatency = metrics.NewHistogramVec(
+		&metrics.HistogramOpts{
+			Namespace:      namespace,
+			Subsystem:      subsystem,
+			Name:           "allocation_duration_seconds",
+			Help:           "Duration in seconds to allocate a Cluster IP by ServiceCIDR",
+			Buckets:        metrics.DefBuckets,
 			StabilityLevel: metrics.ALPHA,
 		},
 		[]string{"cidr"},
@@ -83,5 +95,47 @@ func registerMetrics() {
 		legacyregistry.MustRegister(clusterIPAvailable)
 		legacyregistry.MustRegister(clusterIPAllocations)
 		legacyregistry.MustRegister(clusterIPAllocationErrors)
+		legacyregistry.MustRegister(clusterIPAllocationLatency)
 	})
 }
+
+// metricsRecorderInterface is the interface to record metrics.
+type metricsRecorderInterface interface {
+	setAllocated(cidr string, allocated int)
+	setAvailable(cidr string, available int)
+	setLatency(cidr string, latency time.Duration)
+	incrementAllocations(cidr, scope string)
+	incrementAllocationErrors(cidr, scope string)
+}
+
+// metricsRecorder implements metricsRecorderInterface.
+type metricsRecorder struct{}
+
+func (m *metricsRecorder) setAllocated(cidr string, allocated int) {
+	clusterIPAllocated.WithLabelValues(cidr).Set(float64(allocated))
+}
+
+func (m *metricsRecorder) setAvailable(cidr string, available int) {
+	clusterIPAvailable.WithLabelValues(cidr).Set(float64(available))
+}
+
+func (m *metricsRecorder) setLatency(cidr string, latency time.Duration) {
+	clusterIPAllocationLatency.WithLabelValues(cidr).Observe(latency.Seconds())
+}
+
+func (m *metricsRecorder) incrementAllocations(cidr, scope string) {
+	clusterIPAllocations.WithLabelValues(cidr, scope).Inc()
+}
+
+func (m *metricsRecorder) incrementAllocationErrors(cidr, scope string) {
+	clusterIPAllocationErrors.WithLabelValues(cidr, scope).Inc()
+}
+
+// emptyMetricsRecorder is a null object implements metricsRecorderInterface.
+type emptyMetricsRecorder struct{}
+
+func (*emptyMetricsRecorder) setAllocated(cidr string, allocated int)       {}
+func (*emptyMetricsRecorder) setAvailable(cidr string, available int)       {}
+func (*emptyMetricsRecorder) setLatency(cidr string, latency time.Duration) {}
+func (*emptyMetricsRecorder) incrementAllocations(cidr, scope string)       {}
+func (*emptyMetricsRecorder) incrementAllocationErrors(cidr, scope string)  {}

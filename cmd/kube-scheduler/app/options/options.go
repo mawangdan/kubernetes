@@ -17,6 +17,7 @@ limitations under the License.
 package options
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -24,8 +25,10 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	apiserveroptions "k8s.io/apiserver/pkg/server/options"
+	"k8s.io/apiserver/pkg/util/compatibility"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
@@ -37,10 +40,15 @@ import (
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/client-go/tools/record"
 	cliflag "k8s.io/component-base/cli/flag"
+	basecompatibility "k8s.io/component-base/compatibility"
 	componentbaseconfig "k8s.io/component-base/config"
 	"k8s.io/component-base/config/options"
 	"k8s.io/component-base/logs"
+	logsapi "k8s.io/component-base/logs/api/v1"
 	"k8s.io/component-base/metrics"
+	zpagesfeatures "k8s.io/component-base/zpages/features"
+	"k8s.io/component-base/zpages/flagz"
+	"k8s.io/klog/v2"
 	schedulerappconfig "k8s.io/kubernetes/cmd/kube-scheduler/app/config"
 	"k8s.io/kubernetes/pkg/scheduler"
 	kubeschedulerconfig "k8s.io/kubernetes/pkg/scheduler/apis/config"
@@ -69,18 +77,32 @@ type Options struct {
 
 	Master string
 
+	// ComponentGlobalsRegistry is the registry where the effective versions and feature gates for all components are stored.
+	ComponentGlobalsRegistry basecompatibility.ComponentGlobalsRegistry
+
 	// Flags hold the parsed CLI flags.
 	Flags *cliflag.NamedFlagSets
 }
 
 // NewOptions returns default scheduler app options.
 func NewOptions() *Options {
+	componentGlobalsRegistry := compatibility.DefaultComponentGlobalsRegistry
+	// make sure DefaultKubeComponent is registered in the DefaultComponentGlobalsRegistry.
+	if componentGlobalsRegistry.EffectiveVersionFor(basecompatibility.DefaultKubeComponent) == nil {
+		featureGate := utilfeature.DefaultMutableFeatureGate
+		effectiveVersion := compatibility.DefaultBuildEffectiveVersion()
+		utilruntime.Must(componentGlobalsRegistry.Register(basecompatibility.DefaultKubeComponent, effectiveVersion, featureGate))
+	}
+	return NewOptionsWithComponentGlobalsRegistry(componentGlobalsRegistry)
+}
+
+func NewOptionsWithComponentGlobalsRegistry(componentGlobalsRegistry basecompatibility.ComponentGlobalsRegistry) *Options {
 	o := &Options{
 		SecureServing:  apiserveroptions.NewSecureServingOptions().WithLoopback(),
 		Authentication: apiserveroptions.NewDelegatingAuthenticationOptions(),
 		Authorization:  apiserveroptions.NewDelegatingAuthorizationOptions(),
 		Deprecated: &DeprecatedOptions{
-			PodMaxUnschedulableQDuration: 60 * time.Second,
+			PodMaxInUnschedulablePodsDuration: 5 * time.Minute,
 		},
 		LeaderElection: &componentbaseconfig.LeaderElectionConfiguration{
 			LeaderElect:       true,
@@ -91,8 +113,9 @@ func NewOptions() *Options {
 			ResourceName:      "kube-scheduler",
 			ResourceNamespace: "kube-system",
 		},
-		Metrics: metrics.NewOptions(),
-		Logs:    logs.NewOptions(),
+		Metrics:                  metrics.NewOptions(),
+		Logs:                     logs.NewOptions(),
+		ComponentGlobalsRegistry: componentGlobalsRegistry,
 	}
 
 	o.Authentication.TolerateInClusterLookupFailure = true
@@ -133,12 +156,6 @@ func (o *Options) ApplyDeprecated() {
 	}
 	if deprecated.Changed("kube-api-burst") {
 		o.ComponentConfig.ClientConnection.Burst = o.Deprecated.Burst
-	}
-	if deprecated.Changed("lock-object-namespace") {
-		o.ComponentConfig.LeaderElection.ResourceNamespace = o.Deprecated.ResourceNamespace
-	}
-	if deprecated.Changed("lock-object-name") {
-		o.ComponentConfig.LeaderElection.ResourceName = o.Deprecated.ResourceName
 	}
 }
 
@@ -192,22 +209,25 @@ func (o *Options) initFlags() {
 	o.Authorization.AddFlags(nfs.FlagSet("authorization"))
 	o.Deprecated.AddFlags(nfs.FlagSet("deprecated"))
 	options.BindLeaderElectionFlags(o.LeaderElection, nfs.FlagSet("leader election"))
-	utilfeature.DefaultMutableFeatureGate.AddFlag(nfs.FlagSet("feature gate"))
+	o.ComponentGlobalsRegistry.AddFlags(nfs.FlagSet("feature gate"))
 	o.Metrics.AddFlags(nfs.FlagSet("metrics"))
-	o.Logs.AddFlags(nfs.FlagSet("logs"))
+	logsapi.AddFlags(o.Logs, nfs.FlagSet("logs"))
 
 	o.Flags = &nfs
 }
 
 // ApplyTo applies the scheduler options to the given scheduler app configuration.
-func (o *Options) ApplyTo(c *schedulerappconfig.Config) error {
+func (o *Options) ApplyTo(logger klog.Logger, c *schedulerappconfig.Config) error {
+	if err := o.ComponentGlobalsRegistry.SetFallback(); err != nil {
+		return err
+	}
 	if len(o.ConfigFile) == 0 {
 		// If the --config arg is not specified, honor the deprecated as well as leader election CLI args.
 		o.ApplyDeprecated()
 		o.ApplyLeaderElectionTo(o.ComponentConfig)
 		c.ComponentConfig = *o.ComponentConfig
 	} else {
-		cfg, err := loadConfigFromFile(o.ConfigFile)
+		cfg, err := LoadConfigFromFile(logger, o.ConfigFile)
 		if err != nil {
 			return err
 		}
@@ -220,6 +240,15 @@ func (o *Options) ApplyTo(c *schedulerappconfig.Config) error {
 
 		c.ComponentConfig = *cfg
 	}
+
+	// Build kubeconfig first to so that if it fails, it doesn't cause leaking
+	// goroutines (started from initializing secure serving - which underneath
+	// creates a queue which in its constructor starts a goroutine).
+	kubeConfig, err := createKubeConfig(c.ComponentConfig.ClientConnection, o.Master)
+	if err != nil {
+		return err
+	}
+	c.KubeConfig = kubeConfig
 
 	if err := o.SecureServing.ApplyTo(&c.SecureServing, &c.LoopbackClientConfig); err != nil {
 		return err
@@ -236,7 +265,12 @@ func (o *Options) ApplyTo(c *schedulerappconfig.Config) error {
 
 	// Apply value independently instead of using ApplyDeprecated() because it can't be configured via ComponentConfig.
 	if o.Deprecated != nil {
-		c.PodMaxUnschedulableQDuration = o.Deprecated.PodMaxUnschedulableQDuration
+		c.PodMaxInUnschedulablePodsDuration = o.Deprecated.PodMaxInUnschedulablePodsDuration
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(zpagesfeatures.ComponentFlagz) {
+		if o.Flags != nil {
+			c.Flagz = flagz.NamedFlagSetsReader{FlagSets: *o.Flags}
+		}
 	}
 
 	return nil
@@ -245,7 +279,11 @@ func (o *Options) ApplyTo(c *schedulerappconfig.Config) error {
 // Validate validates all the required options.
 func (o *Options) Validate() []error {
 	var errs []error
-
+	if err := o.ComponentGlobalsRegistry.SetFallback(); err != nil {
+		errs = append(errs, err)
+	} else {
+		errs = append(errs, o.ComponentGlobalsRegistry.Validate()...)
+	}
 	if err := validation.ValidateKubeSchedulerConfiguration(o.ComponentConfig); err != nil {
 		errs = append(errs, err.Errors()...)
 	}
@@ -258,7 +296,8 @@ func (o *Options) Validate() []error {
 }
 
 // Config return a scheduler config object
-func (o *Options) Config() (*schedulerappconfig.Config, error) {
+func (o *Options) Config(ctx context.Context) (*schedulerappconfig.Config, error) {
+	logger := klog.FromContext(ctx)
 	if o.SecureServing != nil {
 		if err := o.SecureServing.MaybeDefaultWithSelfSignedCerts("localhost", nil, []net.IP{netutils.ParseIPSloppy("127.0.0.1")}); err != nil {
 			return nil, fmt.Errorf("error creating self-signed certificates: %v", err)
@@ -266,23 +305,17 @@ func (o *Options) Config() (*schedulerappconfig.Config, error) {
 	}
 
 	c := &schedulerappconfig.Config{}
-	if err := o.ApplyTo(c); err != nil {
-		return nil, err
-	}
-
-	// Prepare kube config.
-	kubeConfig, err := createKubeConfig(c.ComponentConfig.ClientConnection, o.Master)
-	if err != nil {
+	if err := o.ApplyTo(logger, c); err != nil {
 		return nil, err
 	}
 
 	// Prepare kube clients.
-	client, eventClient, err := createClients(kubeConfig)
+	client, eventClient, err := createClients(c.KubeConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	c.EventBroadcaster = events.NewEventBroadcasterAdapter(eventClient)
+	c.EventBroadcaster = events.NewEventBroadcasterAdapterWithContext(ctx, eventClient)
 
 	// Set up leader election if enabled.
 	var leaderElectionConfig *leaderelection.LeaderElectionConfig
@@ -293,18 +326,18 @@ func (o *Options) Config() (*schedulerappconfig.Config, error) {
 			schedulerName = c.ComponentConfig.Profiles[0].SchedulerName
 		}
 		coreRecorder := c.EventBroadcaster.DeprecatedNewLegacyRecorder(schedulerName)
-		leaderElectionConfig, err = makeLeaderElectionConfig(c.ComponentConfig.LeaderElection, kubeConfig, coreRecorder)
+		leaderElectionConfig, err = makeLeaderElectionConfig(c.ComponentConfig.LeaderElection, c.KubeConfig, coreRecorder)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	c.Client = client
-	c.KubeConfig = kubeConfig
 	c.InformerFactory = scheduler.NewInformerFactory(client, 0)
-	dynClient := dynamic.NewForConfigOrDie(kubeConfig)
+	dynClient := dynamic.NewForConfigOrDie(c.KubeConfig)
 	c.DynInformerFactory = dynamicinformer.NewFilteredDynamicSharedInformerFactory(dynClient, 0, corev1.NamespaceAll, nil)
 	c.LeaderElection = leaderElectionConfig
+	c.ComponentGlobalsRegistry = o.ComponentGlobalsRegistry
 
 	return c, nil
 }

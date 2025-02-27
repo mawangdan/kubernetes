@@ -18,34 +18,36 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"io"
 	"os"
 
-	"gopkg.in/yaml.v3"
+	yaml "sigs.k8s.io/yaml/goyaml.v3"
 )
 
 func main() {
 	indent := flag.Int("indent", 2, "default indent")
 	flag.Parse()
-
-	if flag.NArg() > 0 {
-		for _, path := range flag.Args() {
-			sourceYaml, err := os.ReadFile(path)
-			if err != nil {
-				panic(err)
-			}
-			rootNode, err := fetchYaml(sourceYaml)
-			if err != nil {
-				panic(err)
-			}
-			writer, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
-			if err != nil {
-				panic(err)
-			}
-			err = streamYaml(writer, indent, rootNode)
-			if err != nil {
-				panic(err)
-			}
+	for _, path := range flag.Args() {
+		sourceYaml, err := os.ReadFile(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", path, err)
+			continue
+		}
+		rootNode, err := fetchYaml(sourceYaml)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", path, err)
+			continue
+		}
+		writer, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", path, err)
+			continue
+		}
+		err = streamYaml(writer, indent, rootNode)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", path, err)
+			continue
 		}
 	}
 }

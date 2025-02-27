@@ -57,8 +57,8 @@ $GCE_METADATA_SERVER = "169.254.169.254"
 # exist until an initial HNS network has been created on the Windows node - see
 # Add_InitialHnsNetwork().
 $MGMT_ADAPTER_NAME = "vEthernet (Ethernet*"
-$CRICTL_VERSION = 'v1.23.0'
-$CRICTL_SHA256 = '9c5a270f1c23878f247fb9846b8046cb3fd3cd55066ea767d68dfc9c30a7871c'
+$CRICTL_VERSION = 'v1.32.0'
+$CRICTL_SHA512 = 'dc8d5a5821dade9cc56d20f67d77464a0d8b6e43b72cc3c8fa34fdd5927a5eaa7cced6a93906f030e99e9f3e71dd82c60829545a99beccabf4c13b21c8aaf918'
 
 Import-Module -Force C:\common.psm1
 
@@ -297,6 +297,12 @@ function Set-EnvironmentVars {
     "WINDOWS_ENABLE_HYPERV" = ${kube_env}['WINDOWS_ENABLE_HYPERV']
     "ENABLE_NODE_PROBLEM_DETECTOR" = ${kube_env}['ENABLE_NODE_PROBLEM_DETECTOR']
     "NODEPROBLEMDETECTOR_KUBECONFIG_FILE" = ${kube_env}['WINDOWS_NODEPROBLEMDETECTOR_KUBECONFIG_FILE']
+    "ENABLE_AUTH_PROVIDER_GCP" = ${kube_env}['ENABLE_AUTH_PROVIDER_GCP']
+    "AUTH_PROVIDER_GCP_STORAGE_PATH" = ${kube_env}['AUTH_PROVIDER_GCP_STORAGE_PATH']
+    "AUTH_PROVIDER_GCP_VERSION" = ${kube_env}['AUTH_PROVIDER_GCP_VERSION']
+    "AUTH_PROVIDER_GCP_HASH_WINDOWS_AMD64" = ${kube_env}['AUTH_PROVIDER_GCP_HASH_WINDOWS_AMD64']
+    "AUTH_PROVIDER_GCP_WINDOWS_BIN_DIR" = ${kube_env}['AUTH_PROVIDER_GCP_WINDOWS_BIN_DIR']
+    "AUTH_PROVIDER_GCP_WINDOWS_CONF_FILE" = ${kube_env}['AUTH_PROVIDER_GCP_WINDOWS_CONF_FILE']
 
     "Path" = ${env:Path} + ";" + ${kube_env}['NODE_DIR']
     "KUBE_NETWORK" = "l2bridge".ToLower()
@@ -356,39 +362,6 @@ function Download-HelperScripts {
         -OutFile ${env:K8S_DIR}\hns.psm1 `
         -URLs 'https://storage.googleapis.com/gke-release/winnode/config/sdn/master/hns.psm1'
   }
-}
-
-# Downloads the gke-exec-auth-plugin for TPM-based authentication to the
-# master, if auth plugin support has been requested for this node (see
-# Test-NodeUsesAuthPlugin).
-# https://github.com/kubernetes/cloud-provider-gcp/tree/master/cmd/gke-exec-auth-plugin
-#
-# Required ${kube_env} keys:
-#   EXEC_AUTH_PLUGIN_LICENSE_URL
-#   EXEC_AUTH_PLUGIN_HASH
-#   EXEC_AUTH_PLUGIN_URL
-function DownloadAndInstall-AuthPlugin {
-  if (-not (Test-NodeUsesAuthPlugin ${kube_env})) {
-    Log-Output 'Skipping download of auth plugin'
-    return
-  }
-  if (-not (ShouldWrite-File "${env:NODE_DIR}\gke-exec-auth-plugin.exe")) {
-    return
-  }
-
-  if (-not ($kube_env.ContainsKey('EXEC_AUTH_PLUGIN_LICENSE_URL') -and
-            $kube_env.ContainsKey('EXEC_AUTH_PLUGIN_HASH') -and
-            $kube_env.ContainsKey('EXEC_AUTH_PLUGIN_URL'))) {
-    Log-Output -Fatal ("Missing one or more kube-env keys needed for " +
-                       "downloading auth plugin: $(Out-String $kube_env)")
-  }
-  MustDownload-File `
-      -URLs ${kube_env}['EXEC_AUTH_PLUGIN_URL'] `
-      -Hash ${kube_env}['EXEC_AUTH_PLUGIN_HASH'] `
-      -OutFile "${env:NODE_DIR}\gke-exec-auth-plugin.exe"
-  MustDownload-File `
-      -URLs ${kube_env}['EXEC_AUTH_PLUGIN_LICENSE_URL'] `
-      -OutFile "${env:LICENSE_DIR}\LICENSE_gke-exec-auth-plugin.txt"
 }
 
 # Downloads the Kubernetes binaries from kube-env's NODE_BINARY_TAR_URL and
@@ -569,15 +542,6 @@ function Create-NodePki {
     Log-Output -Fatal 'CA_CERT not present in kube-env'
   }
 
-  # On nodes that use a plugin to support authentication, KUBELET_CERT and
-  # KUBELET_KEY will not be present - TPM_BOOTSTRAP_CERT and TPM_BOOTSTRAP_KEY
-  # should be set instead.
-  if (Test-NodeUsesAuthPlugin ${kube_env}) {
-    Log-Output ('Skipping KUBELET_CERT and KUBELET_KEY, plugin will be used ' +
-                'for authentication')
-    return
-  }
-
   if ($kube_env.ContainsKey('KUBELET_CERT')) {
     $KUBELET_CERT = ${kube_env}['KUBELET_CERT']
     Write_PkiData "${KUBELET_CERT}" ${env:KUBELET_CERT_PATH}
@@ -597,7 +561,7 @@ function Create-NodePki {
 }
 
 # Creates the bootstrap kubelet kubeconfig at $env:BOOTSTRAP_KUBECONFIG.
-# https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet-tls-bootstrapping/
+# https://kubernetes.io/docs/reference/access-authn-authz/kubelet-tls-bootstrapping/
 #
 # Create-NodePki() must be called first.
 #
@@ -668,11 +632,7 @@ function Write_KubeconfigFromMetadata {
 # Required ${kube_env} keys:
 #   KUBERNETES_MASTER_NAME: the apiserver IP address.
 function Create-KubeletKubeconfig {
-  if (Test-NodeUsesAuthPlugin ${kube_env}) {
-    Write_KubeconfigFromMetadata
-  } else {
-    Write_BootstrapKubeconfig
-  }
+  Write_BootstrapKubeconfig
 }
 
 # Creates the kubeconfig user file for applications that communicate with Kubernetes.
@@ -892,8 +852,12 @@ function Configure-HostNetworkingService {
         -Verbose
     $created_hns_network = $true
   }
-
+  # This name of endpoint is referred in pkg/proxy/winkernel/proxier.go as part of
+  # kube-proxy as well. A health check port for every service that is specified as
+  # "externalTrafficPolicy: local" will be added on the endpoint.
+  # PLEASE KEEP THEM CONSISTENT!!!
   $endpoint_name = "cbr0"
+
   $vnic_name = "vEthernet (${endpoint_name})"
 
   $hns_endpoint = Get-HnsEndpoint | Where-Object Name -eq $endpoint_name
@@ -1054,11 +1018,9 @@ function Start-WorkerServices {
   )
 
   $kubelet_args = ${default_kubelet_args} + ${kubelet_args}
-  if (-not (Test-NodeUsesAuthPlugin ${kube_env})) {
-    Log-Output 'Using bootstrap kubeconfig for authentication'
-    $kubelet_args = (${kubelet_args} +
-                     "--bootstrap-kubeconfig=${env:BOOTSTRAP_KUBECONFIG}")
-  }
+  Log-Output 'Using bootstrap kubeconfig for authentication'
+  $kubelet_args = (${kubelet_args} +
+                   "--bootstrap-kubeconfig=${env:BOOTSTRAP_KUBECONFIG}")
   Log-Output "Final kubelet_args: ${kubelet_args}"
 
   # Compute kube-proxy args
@@ -1162,12 +1124,34 @@ function WaitFor_KubeletAndKubeProxyReady {
 }
 
 # Runs 'kubectl get nodes'.
-# TODO(pjh): run more verification commands.
+# Runs additional verification commands to ensure node successfully joined cluster
+# and that it connects to the API Server.
 function Verify-WorkerServices {
-  Log-Output ("kubectl get nodes:`n" +
-              $(& "${env:NODE_DIR}\kubectl.exe" get nodes | Out-String))
+  $timeout = 12
+  $retries = 0
+  $retryDelayInSeconds = 5
+
+  Log-Output ("Testing node connection to API server...")
+  do {
+      $retries++
+      $nodes_list = & "${env:NODE_DIR}\kubectl.exe" get nodes -o=custom-columns=:.metadata.name -A | Out-String
+      $host_status = & "${env:NODE_DIR}\kubectl.exe" get nodes (hostname) -o=custom-columns=:.status.conditions[4].type | Out-String
+      Start-Sleep $retryDelayInSeconds
+  } while (((-Not $nodes_list) -or (-Not $nodes_list.contains((hostname))) -or (-Not $host_status.contains("Ready")))-and ($retries -le $timeout))
+
+  If (-Not $nodes_list){
+      Throw ("Node: '$(hostname)' failed to connect to API server")
+
+  }ElseIf (-Not $nodes_list.contains((hostname))) {
+      Throw ("Node: '$(hostname)' failed to join the cluster; NODES: '`n $($nodes_list)'")
+
+  }ELseIf (-Not $host_status.contains("Ready")) {
+      Throw ("Node: '$(hostname)' is not in Ready state")
+  }
+
+  Log-Output ("Node: $(hostname) successfully joined cluster `n NODES: `n $($nodes_list)")
   Verify_GceMetadataServerRouteIsPresent
-  Log_Todo "run more verification commands."
+
 }
 
 # Downloads the Windows crictl package and installs its contents (e.g.
@@ -1176,15 +1160,13 @@ function DownloadAndInstall-Crictl {
   if (-not (ShouldWrite-File ${env:NODE_DIR}\crictl.exe)) {
     return
   }
-  $CRI_TOOLS_GCS_BUCKET = 'k8s-artifacts-cri-tools'
-  $url = ('https://storage.googleapis.com/' + $CRI_TOOLS_GCS_BUCKET +
-          '/release/' + $CRICTL_VERSION + '/crictl-' + $CRICTL_VERSION +
-          '-windows-amd64.tar.gz')
+  $url = ('https://github.com/kubernetes-sigs/cri-tools/releases/download/' +
+          $CRICTL_VERSION + '/crictl-' + $CRICTL_VERSION + '-windows-amd64.tar.gz')
   MustDownload-File `
       -URLs $url `
       -OutFile ${env:NODE_DIR}\crictl.tar.gz `
-      -Hash $CRICTL_SHA256 `
-      -Algorithm SHA256
+      -Hash $CRICTL_SHA512 `
+      -Algorithm SHA512
   tar xzvf ${env:NODE_DIR}\crictl.tar.gz -C ${env:NODE_DIR}
 }
 
@@ -1398,7 +1380,7 @@ function Install_Containerd {
   New-Item $tmp_dir -ItemType 'directory' -Force | Out-Null
 
   # TODO(ibrahimab) Change this to a gcs bucket with CI maintained and accessible by community.
-  $version = '1.5.4'
+  $version = '1.6.2'
   $tar_url = ("https://github.com/containerd/containerd/releases/download/v${version}/" +
               "cri-containerd-cni-${version}-windows-amd64.tar.gz")
   $sha_url = $tar_url + ".sha256sum"
@@ -1412,7 +1394,7 @@ function Install_Containerd {
       -Algorithm SHA256
 
   tar xzvf $tmp_dir\containerd.tar.gz -C $tmp_dir
-  Move-Item -Force $tmp_dir\cni\*.exe "${env:CNI_DIR}\"
+  Move-Item -Force $tmp_dir\cni\bin\*.exe "${env:CNI_DIR}\"
   Move-Item -Force $tmp_dir\*.exe "${env:NODE_DIR}\"
   Remove-Item -Force -Recurse $tmp_dir
 
@@ -1559,10 +1541,21 @@ function DownloadAndInstall-NodeProblemDetector {
 #   CA_CERT
 #   NODE_PROBLEM_DETECTOR_TOKEN
 function Create-NodeProblemDetectorKubeConfig {
-  if (-not [string]::IsNullOrEmpty(${env:NODEPROBLEMDETECTOR_KUBECONFIG_FILE})) {
-    Create-Kubeconfig -Name 'node-problem-detector' `
-      -Path ${env:NODEPROBLEMDETECTOR_KUBECONFIG_FILE} `
-      -Token ${kube_env}['NODE_PROBLEM_DETECTOR_TOKEN']
+  if ("${env:ENABLE_NODE_PROBLEM_DETECTOR}" -eq "standalone") {
+    if (-not [string]::IsNullOrEmpty(${kube_env]['NODE_PROBLEM_DETECTOR_TOKEN']})) {
+      Log-Output "Create-NodeProblemDetectorKubeConfig using Node Problem Detector token"
+      Create-Kubeconfig -Name 'node-problem-detector' `
+        -Path ${env:NODEPROBLEMDETECTOR_KUBECONFIG_FILE} `
+        -Token ${kube_env}['NODE_PROBLEM_DETECTOR_TOKEN']
+    } elseif (Test-Path ${env:BOOTSTRAP_KUBECONFIG}) {
+      Log-Output "Create-NodeProblemDetectorKubeConfig creating kubeconfig from kubelet kubeconfig"
+      Copy-Item ${env:BOOTSTRAP_KUBECONFIG} -Destination ${env:NODEPROBLEMDETECTOR_KUBECONFIG_FILE}
+      Log-Output ("node-problem-detector bootstrap kubeconfig:`n" +
+              "$(Get-Content -Raw ${env:NODEPROBLEMDETECTOR_KUBECONFIG_FILE})")
+    } else {
+      Log-Output "Either NODE_PROBLEM_DETECTOR_TOKEN or ${env:BOOTSTRAP_KUBECONFIG} must be set"
+      exit 1
+    }
   }
 }
 
@@ -2307,6 +2300,52 @@ $FLUENTD_CONFIG = @'
   </record>
 </filter>
 '@
+
+# Downloads the out-of-tree kubelet image credential provider binaries.
+function DownloadAndInstall-AuthProviderGcpBinary {
+  if ("${env:ENABLE_AUTH_PROVIDER_GCP}" -eq "true") {
+    $filename = 'auth-provider-gcp.exe'
+    if (ShouldWrite-File ${env:AUTH_PROVIDER_GCP_WINDOWS_BIN_DIR}\$filename) {
+      Log-Output "Installing auth provider gcp binaries"
+      $tmp_dir = 'C:\k8s_tmp'
+      New-Item -Force -ItemType 'directory' $tmp_dir | Out-Null
+      $url = "${env:AUTH_PROVIDER_GCP_STORAGE_PATH}/${env:AUTH_PROVIDER_GCP_VERSION}/windows_amd64/$filename"
+      MustDownload-File -Hash $AUTH_PROVIDER_GCP_HASH_WINDOWS_AMD64 -Algorithm SHA512 -OutFile $tmp_dir\$filename -URLs $url
+      Move-Item -Force $tmp_dir\$filename ${env:AUTH_PROVIDER_GCP_WINDOWS_BIN_DIR}
+      Remove-Item -Force -Recurse $tmp_dir
+    } else {
+      Log-Output "Skipping auth provider gcp binaries installation, auth-provider-gcp.exe file already exists."
+    }
+  }
+}
+
+# Creates config file for the out-of-tree kubelet image credential provider.
+function Create-AuthProviderGcpConfig {
+  if ("${env:ENABLE_AUTH_PROVIDER_GCP}" -eq "true") {
+    if (ShouldWrite-File ${env:AUTH_PROVIDER_GCP_WINDOWS_CONF_FILE}) {
+      Log-Output "Creating auth provider gcp config file"
+      Set-Content ${env:AUTH_PROVIDER_GCP_WINDOWS_CONF_FILE} @'
+kind: CredentialProviderConfig
+apiVersion: kubelet.config.k8s.io/v1
+providers:
+  - name: auth-provider-gcp.exe
+    apiVersion: credentialprovider.kubelet.k8s.io/v1
+    matchImages:
+    - "container.cloud.google.com"
+    - "gcr.io"
+    - "*.gcr.io"
+    - "*.pkg.dev"
+    args:
+    - get-credentials
+    - --v=3
+    defaultCacheDuration: 1m
+'@
+    } else {
+      Log-Output "Skipping auth provider gcp config file creation, it already exists"
+    }
+  }
+}
+
 
 # Export all public functions:
 Export-ModuleMember -Function *-*

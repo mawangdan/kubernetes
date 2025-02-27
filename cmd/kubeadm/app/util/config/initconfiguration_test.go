@@ -18,6 +18,7 @@ package config
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -26,11 +27,19 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 
-	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
+	"k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta4"
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 )
 
 func TestLoadInitConfigurationFromFile(t *testing.T) {
+	certDir := "/tmp/foo"
+	clusterCfg := []byte(fmt.Sprintf(`
+apiVersion: %s
+kind: ClusterConfiguration
+certificatesDir: %s
+kubernetesVersion: %s`, kubeadmapiv1.SchemeGroupVersion.String(), certDir, constants.MinimumControlPlaneVersion.String()))
+
 	// Create temp folder for the test case
 	tmpdir, err := os.MkdirTemp("", "")
 	if err != nil {
@@ -43,37 +52,38 @@ func TestLoadInitConfigurationFromFile(t *testing.T) {
 		name         string
 		fileContents []byte
 		expectErr    bool
+		validate     func(*testing.T, *kubeadm.InitConfiguration)
 	}{
-		{
-			name:         "v1beta2.partial1",
-			fileContents: cfgFiles["InitConfiguration_v1beta2"],
-		},
-		{
-			name:         "v1beta2.partial2",
-			fileContents: cfgFiles["ClusterConfiguration_v1beta2"],
-		},
-		{
-			name: "v1beta2.full",
-			fileContents: bytes.Join([][]byte{
-				cfgFiles["InitConfiguration_v1beta2"],
-				cfgFiles["ClusterConfiguration_v1beta2"],
-				cfgFiles["Kube-proxy_componentconfig"],
-				cfgFiles["Kubelet_componentconfig"],
-			}, []byte(constants.YAMLDocumentSeparator)),
-		},
 		{
 			name:         "v1beta3.partial1",
 			fileContents: cfgFiles["InitConfiguration_v1beta3"],
 		},
 		{
-			name:         "v1beta3.partial2",
-			fileContents: cfgFiles["ClusterConfiguration_v1beta3"],
+			name: "v1beta3.partial2",
+			fileContents: bytes.Join([][]byte{
+				cfgFiles["InitConfiguration_v1beta3"],
+				clusterCfg,
+			}, []byte(constants.YAMLDocumentSeparator)),
+			validate: func(t *testing.T, cfg *kubeadm.InitConfiguration) {
+				if cfg.ClusterConfiguration.CertificatesDir != certDir {
+					t.Errorf("CertificatesDir from ClusterConfiguration holds the wrong value, Expected: %v. Actual: %v", certDir, cfg.ClusterConfiguration.CertificatesDir)
+				}
+			},
 		},
 		{
 			name: "v1beta3.full",
 			fileContents: bytes.Join([][]byte{
 				cfgFiles["InitConfiguration_v1beta3"],
 				cfgFiles["ClusterConfiguration_v1beta3"],
+				cfgFiles["Kube-proxy_componentconfig"],
+				cfgFiles["Kubelet_componentconfig"],
+			}, []byte(constants.YAMLDocumentSeparator)),
+		},
+		{
+			name: "v1beta4.full",
+			fileContents: bytes.Join([][]byte{
+				cfgFiles["InitConfiguration_v1beta4"],
+				cfgFiles["ClusterConfiguration_v1beta4"],
 				cfgFiles["Kube-proxy_componentconfig"],
 				cfgFiles["Kubelet_componentconfig"],
 			}, []byte(constants.YAMLDocumentSeparator)),
@@ -89,7 +99,11 @@ func TestLoadInitConfigurationFromFile(t *testing.T) {
 				return
 			}
 
-			obj, err := LoadInitConfigurationFromFile(cfgPath)
+			opts := LoadOrDefaultConfigurationOptions{
+				SkipCRIDetect: true,
+			}
+
+			obj, err := LoadInitConfigurationFromFile(cfgPath, opts)
 			if rt.expectErr {
 				if err == nil {
 					t.Error("Unexpected success")
@@ -103,6 +117,10 @@ func TestLoadInitConfigurationFromFile(t *testing.T) {
 				if obj == nil {
 					t.Error("Unexpected nil return value")
 				}
+			}
+			// exec additional validation on the returned value
+			if rt.validate != nil {
+				rt.validate(t, obj)
 			}
 		})
 	}
@@ -122,7 +140,7 @@ func TestDefaultTaintsMarshaling(t *testing.T) {
 					Kind:       constants.InitConfigurationKind,
 				},
 			},
-			expectedTaintCnt: 2,
+			expectedTaintCnt: 1,
 		},
 		{
 			desc: "Uninitialized taints field produces expected taints",
@@ -131,9 +149,8 @@ func TestDefaultTaintsMarshaling(t *testing.T) {
 					APIVersion: kubeadmapiv1.SchemeGroupVersion.String(),
 					Kind:       constants.InitConfigurationKind,
 				},
-				NodeRegistration: kubeadmapiv1.NodeRegistrationOptions{},
 			},
-			expectedTaintCnt: 2,
+			expectedTaintCnt: 1,
 		},
 		{
 			desc: "Forsing taints to an empty slice produces no taints",
@@ -173,7 +190,7 @@ func TestDefaultTaintsMarshaling(t *testing.T) {
 				t.Fatalf("unexpected error while marshalling to YAML: %v", err)
 			}
 
-			cfg, err := BytesToInitConfiguration(b)
+			cfg, err := BytesToInitConfiguration(b, true)
 			if err != nil {
 				t.Fatalf("unexpected error of BytesToInitConfiguration: %v\nconfig: %s", err, string(b))
 			}

@@ -28,7 +28,6 @@ import (
 	"github.com/google/go-cmp/cmp"
 	fuzz "github.com/google/gofuzz"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/pkg/apis/clientauthentication"
 	clientauthenticationapi "k8s.io/client-go/pkg/apis/clientauthentication"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/client-go/transport"
@@ -243,6 +242,9 @@ func TestConfigToExecClusterRoundtrip(t *testing.T) {
 		func(h *WarningHandler, f fuzz.Continue) {
 			*h = &fakeWarningHandler{}
 		},
+		func(h *WarningHandlerWithContext, f fuzz.Continue) {
+			*h = &fakeWarningHandlerWithContext{}
+		},
 		// Authentication does not require fuzzer
 		func(r *AuthProviderConfigPersister, f fuzz.Continue) {},
 		func(r *clientcmdapi.AuthProviderConfig, f fuzz.Continue) {
@@ -290,6 +292,7 @@ func TestConfigToExecClusterRoundtrip(t *testing.T) {
 		expected.Burst = 0
 		expected.RateLimiter = nil
 		expected.WarningHandler = nil
+		expected.WarningHandlerWithContext = nil
 		expected.Timeout = 0
 		expected.Dial = nil
 
@@ -353,7 +356,7 @@ func TestExecClusterToConfigRoundtrip(t *testing.T) {
 		},
 	)
 	for i := 0; i < 100; i++ {
-		expected := &clientauthentication.Cluster{}
+		expected := &clientauthenticationapi.Cluster{}
 		f.Fuzz(expected)
 
 		// Manually set URLs so we don't get an error when parsing these during the roundtrip.

@@ -21,8 +21,8 @@ import (
 	"reflect"
 	"strings"
 
-	jsonpatch "github.com/evanphx/json-patch"
 	"github.com/spf13/cobra"
+	jsonpatch "gopkg.in/evanphx/json-patch.v4"
 	"k8s.io/klog/v2"
 
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -35,11 +35,13 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 
 	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/cli-runtime/pkg/printers"
 	"k8s.io/cli-runtime/pkg/resource"
+	"k8s.io/client-go/tools/clientcmd"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/scheme"
-	"k8s.io/kubectl/pkg/util"
+	"k8s.io/kubectl/pkg/util/completion"
 	"k8s.io/kubectl/pkg/util/i18n"
 	"k8s.io/kubectl/pkg/util/templates"
 )
@@ -83,10 +85,9 @@ type LabelOptions struct {
 	enforceNamespace             bool
 	builder                      *resource.Builder
 	unstructuredClientForMapping func(mapping *meta.RESTMapping) (resource.RESTClient, error)
-	dryRunVerifier               *resource.DryRunVerifier
 
 	// Common shared fields
-	genericclioptions.IOStreams
+	genericiooptions.IOStreams
 }
 
 var (
@@ -119,7 +120,7 @@ var (
 		kubectl label pods foo bar-`))
 )
 
-func NewLabelOptions(ioStreams genericclioptions.IOStreams) *LabelOptions {
+func NewLabelOptions(ioStreams genericiooptions.IOStreams) *LabelOptions {
 	return &LabelOptions{
 		RecordFlags: genericclioptions.NewRecordFlags(),
 		Recorder:    genericclioptions.NoopRecorder{},
@@ -130,7 +131,7 @@ func NewLabelOptions(ioStreams genericclioptions.IOStreams) *LabelOptions {
 	}
 }
 
-func NewCmdLabel(f cmdutil.Factory, ioStreams genericclioptions.IOStreams) *cobra.Command {
+func NewCmdLabel(f cmdutil.Factory, ioStreams genericiooptions.IOStreams) *cobra.Command {
 	o := NewLabelOptions(ioStreams)
 
 	cmd := &cobra.Command{
@@ -139,7 +140,7 @@ func NewCmdLabel(f cmdutil.Factory, ioStreams genericclioptions.IOStreams) *cobr
 		Short:                 i18n.T("Update the labels on a resource"),
 		Long:                  fmt.Sprintf(labelLong, validation.LabelValueMaxLength),
 		Example:               labelExample,
-		ValidArgsFunction:     util.ResourceTypeAndNameCompletionFunc(f),
+		ValidArgsFunction:     completion.ResourceTypeAndNameCompletionFunc(f),
 		Run: func(cmd *cobra.Command, args []string) {
 			cmdutil.CheckErr(o.Complete(f, cmd, args))
 			cmdutil.CheckErr(o.Validate())
@@ -181,15 +182,11 @@ func (o *LabelOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args []st
 	if err != nil {
 		return err
 	}
-	dynamicClient, err := f.DynamicClient()
-	if err != nil {
-		return err
-	}
-	o.dryRunVerifier = resource.NewDryRunVerifier(dynamicClient, f.OpenAPIGetter())
 
-	cmdutil.PrintFlagsWithDryRunStrategy(o.PrintFlags, o.dryRunStrategy)
 	o.ToPrinter = func(operation string) (printers.ResourcePrinter, error) {
 		o.PrintFlags.NamePrintFlags.Operation = operation
+		// PrintFlagsWithDryRunStrategy must be done after NamePrintFlags.Operation is set
+		cmdutil.PrintFlagsWithDryRunStrategy(o.PrintFlags, o.dryRunStrategy)
 		return o.PrintFlags.ToPrinter()
 	}
 
@@ -208,7 +205,7 @@ func (o *LabelOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args []st
 	}
 
 	o.namespace, o.enforceNamespace, err = f.ToRawKubeConfigLoader().Namespace()
-	if err != nil {
+	if err != nil && !(o.local && clientcmd.IsEmptyConfig(err)) {
 		return err
 	}
 	o.builder = f.NewBuilder()
@@ -342,11 +339,6 @@ func (o *LabelOptions) RunLabel() error {
 			}
 
 			mapping := info.ResourceMapping()
-			if o.dryRunStrategy == cmdutil.DryRunServer {
-				if err := o.dryRunVerifier.HasSupport(mapping.GroupVersionKind); err != nil {
-					return err
-				}
-			}
 			client, err := o.unstructuredClientForMapping(mapping)
 			if err != nil {
 				return err
@@ -408,9 +400,9 @@ func updateDataChangeMsg(oldObj []byte, newObj []byte, overwrite bool) string {
 
 func validateNoOverwrites(accessor metav1.Object, labels map[string]string) error {
 	allErrs := []error{}
-	for key := range labels {
-		if value, found := accessor.GetLabels()[key]; found {
-			allErrs = append(allErrs, fmt.Errorf("'%s' already has a value (%s), and --overwrite is false", key, value))
+	for key, value := range labels {
+		if currValue, found := accessor.GetLabels()[key]; found && currValue != value {
+			allErrs = append(allErrs, fmt.Errorf("'%s' already has a value (%s), and --overwrite is false", key, currValue))
 		}
 	}
 	return utilerrors.NewAggregate(allErrs)
